@@ -11,12 +11,21 @@ class VectorizedAdditionDataset(IterableDataset):
     n1, n2 are L-digit numbers (or smaller padded).
     """
 
-    def __init__(self, min_digits, max_digits, batch_size, offset_range=100):
+    def __init__(
+        self,
+        min_digits,
+        max_digits,
+        batch_size,
+        offset_range_bottom,
+        offset_range_top,
+        val=False,
+    ):
         super().__init__()
         self.min_digits = min_digits
         self.max_digits = max_digits
         self.batch_size = batch_size
-        self.offset_range = offset_range
+        self.offset_range_bottom = offset_range_bottom
+        self.offset_range_top = offset_range_top
 
         self.chars = "0123456789+=#"
         self.stoi = {ch: i for i, ch in enumerate(self.chars)}
@@ -74,7 +83,7 @@ class VectorizedAdditionDataset(IterableDataset):
         pos1 = torch.cat([p1_seg1, p1_seg2, p1_seg3], dim=1)
 
         idx_1_L = torch.arange(L, -1, -1)
-        idx_L_0 = torch.arange(1, L+2)
+        idx_L_0 = torch.arange(1, L + 2)
 
         pos2_seq = torch.cat(
             [
@@ -86,8 +95,8 @@ class VectorizedAdditionDataset(IterableDataset):
 
         pos2 = pos2_seq.unsqueeze(0).expand(B, -1)  # (B, SeqLen)
 
-        offsets = torch.randint(0, self.offset_range, (B, 1))
-        # pos2 = pos2 + offsets
+        offsets = torch.randint(self.offset_range_bottom, self.offset_range_top, (B, 1))
+        pos2 = pos2 + offsets
 
         # 5. Form (x, y)
         x = tokens[:, :-1]
@@ -108,6 +117,7 @@ class AdditionDataModule(pl.LightningDataModule):
         batch_size=64,
         num_workers=0,
         curriculum_start=3,
+        max_pos2=3 * 15,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -119,6 +129,8 @@ class AdditionDataModule(pl.LightningDataModule):
             self.hparams.min_train_digits,
             self.hparams.max_train_digits,
             self.hparams.batch_size,
+            0,
+            self.hparams.max_pos2 - self.hparams.max_train_digits,
         )
 
         # Validation datasets: Multiple datasets for generalization
@@ -142,7 +154,11 @@ class AdditionDataModule(pl.LightningDataModule):
         # 1. In-distribution set
         self.val_datasets.append(
             VectorizedAdditionDataset(
-                train_dist_val, train_dist_val, self.hparams.batch_size
+                train_dist_val,
+                train_dist_val,
+                self.hparams.batch_size,
+                self.hparams.max_val_digits / 4,
+                3 * self.hparams.max_val_digits / 4,
             )
         )
         self.val_names.append(f"val_L{train_dist_val}")
@@ -150,7 +166,13 @@ class AdditionDataModule(pl.LightningDataModule):
         # 2. Generalization sets
         for L in val_lengths:
             self.val_datasets.append(
-                VectorizedAdditionDataset(L, L, self.hparams.batch_size)
+                VectorizedAdditionDataset(
+                    L,
+                    L,
+                    self.hparams.batch_size,
+                    self.hparams.max_val_digits / 4,
+                    3 * self.hparams.max_val_digits / 4,
+                )
             )
             self.val_names.append(f"val_L{L}")
 
@@ -159,7 +181,10 @@ class AdditionDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(
-            self.train_ds, batch_size=None, num_workers=self.hparams.num_workers
+            self.train_ds,
+            batch_size=None,
+            num_workers=self.hparams.num_workers,
+            persistent_workers=self.hparams.num_workers > 0,
         )
 
     def on_train_epoch_start(self):
@@ -184,19 +209,27 @@ class AdditionDataModule(pl.LightningDataModule):
 
         # 1. Regular Grid (Coarse view across entire range)
         # e.g., 1, 5, 9, 13, 17... if step is 4
-        lengths_grid = list(range(min_train, max_val + 1, max(1, val_step)))
+        lengths_grid = list(range(min_train, max_val, max(1, val_step)))
 
         # 2. Critical Curriculum Points
         # Always check exactly where we are training, and the immediate next step
-        curriculum_points = [current_max, min(current_max + 1, max_val)]
+        # curriculum_points = [current_max, min(current_max + 1, max_val)]
 
         # Combine and Deduplicate
-        lengths = sorted(list(set(lengths_grid + curriculum_points)))
+        lengths = sorted(list(set(lengths_grid)))
 
         dataloaders = []
         self.val_names = []  # Reset and repopulate
+        offset_range_bottom = self.hparams.max_val_digits // 3
+        offset_range_top = 4 * self.hparams.max_val_digits // 3
         for L in lengths:
-            ds = VectorizedAdditionDataset(L, L, self.hparams.batch_size)
+            ds = VectorizedAdditionDataset(
+                L,
+                L,
+                self.hparams.batch_size,
+                offset_range_bottom=offset_range_bottom,
+                offset_range_top=offset_range_top,
+            )
             dataloaders.append(
                 DataLoader(
                     ds,

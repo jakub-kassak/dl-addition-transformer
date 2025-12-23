@@ -111,6 +111,7 @@ class GPTLightningModule(pl.LightningModule):
         max_pos2=1500,
         pad_token=-1,
         eq_token=-1,
+        val_k=1,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -206,6 +207,9 @@ class GPTLightningModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         idx, targets, pos1_ids, pos2_ids = batch
+        L = (pos1_ids[0] == 1).sum() - 1
+        if batch_idx == 0:
+            print(f"DEBUG: validation_step L={L.item()}")
         logits, loss = self(idx, pos1_ids, pos2_ids, targets)
 
         # Determine dataset name via dataloader_idx
@@ -213,7 +217,7 @@ class GPTLightningModule(pl.LightningModule):
         # Lightning adds /dataloader_idx_N
 
         self.log(
-            "val_loss",
+           "val_loss",
             loss,
             on_step=False,
             on_epoch=True,
@@ -270,6 +274,81 @@ class GPTLightningModule(pl.LightningModule):
             add_dataloader_idx=True,
         )
 
+        # 3. Majority Voting Validation
+        if self.hparams.val_k > 1:
+            # Find '=' position
+            eq_indices = (idx == self.hparams.eq_token).nonzero(as_tuple=True)
+            # All items in batch have same '=' position in this dataset
+            eq_idx = eq_indices[1][0].item()
+
+            prefix_idx = idx[:, : eq_idx + 1]
+            prefix_p1 = pos1_ids[:, : eq_idx + 1]
+            prefix_p2 = pos2_ids[:, : eq_idx + 1]
+
+            target_sum = targets[:, eq_idx:]  # (B, sum_len)
+            target_mask = target_sum != self.hparams.pad_token
+            sum_len = target_sum.shape[1]
+
+            # Ground truth positions for the sum part
+            rest_p1 = pos1_ids[:, eq_idx + 1 :]
+            rest_p2 = pos2_ids[:, eq_idx + 1 :]
+
+            k = self.hparams.val_k
+            B = idx.shape[0]
+
+            # Repeat for k samples
+            x_k = prefix_idx.repeat_interleave(k, dim=0)
+            p1_k = prefix_p1.repeat_interleave(k, dim=0)
+            p2_k = prefix_p2.repeat_interleave(k, dim=0)
+            rp1_k = rest_p1.repeat_interleave(k, dim=0)
+            rp2_k = rest_p2.repeat_interleave(k, dim=0)
+
+            # Generate (B*k, eq_idx + 1 + sum_len)
+            out_k = self.generate(
+                x_k, p1_k, p2_k, max_new_tokens=sum_len, external_pos=(rp1_k, rp2_k)
+            )
+            pred_sum_k = out_k[:, eq_idx + 1 :]  # (B*k, sum_len)
+
+            # Reshape to (B, k, sum_len)
+            pred_sum_k = pred_sum_k.view(B, k, sum_len)
+
+            # 3a. Sequence-wise Majority Vote
+            # For each item in B, find the sequence that occurs most often among k
+            final_pred_seq = []
+            for i in range(B):
+                # Convert sequences to tuples for hashability
+                seqs = [tuple(s.tolist()) for s in pred_sum_k[i]]
+                most_common = max(set(seqs), key=seqs.count)
+                final_pred_seq.append(torch.tensor(most_common, device=self.device))
+            final_pred_seq = torch.stack(final_pred_seq)  # (B, sum_len)
+
+            # Calculate MV Seq Accuracy
+            # Sequence is correct if all non-pad tokens match
+            # But targets are already masked/padded correctly for the sum range
+            seq_mv_correct = (final_pred_seq == target_sum) | (~target_mask)
+            seq_mv_acc = seq_mv_correct.all(dim=1).float().mean()
+            self.log(
+                "val_acc_seq_mv", seq_mv_acc, on_epoch=True, add_dataloader_idx=True
+            )
+
+            # 3b. Digit-wise Majority Vote
+            # For each item in B and each digit position, find most frequent digit among k
+            # Using mode: returns (values, indices)
+            # pred_sum_k: (B, k, sum_len)
+            # Move to CPU because torch.mode is not implemented on MPS
+            final_pred_digit = torch.mode(pred_sum_k.cpu(), dim=1).values.to(
+                self.device
+            )  # (B, sum_len)
+
+            digit_mv_correct = final_pred_digit == target_sum
+            # Mask out padding
+            digit_mv_acc = (
+                digit_mv_correct & target_mask
+            ).sum().float() / target_mask.sum().float()
+            self.log(
+                "val_acc_digit_mv", digit_mv_acc, on_epoch=True, add_dataloader_idx=True
+            )
+
         return loss
 
     def on_validation_epoch_end(self):
@@ -320,19 +399,48 @@ class GPTLightningModule(pl.LightningModule):
         }
 
     @torch.no_grad()
-    def generate(self, idx, pos1_ids, pos2_ids, max_new_tokens):
-        for _ in range(max_new_tokens):
+    def generate(self, idx, pos1_ids, pos2_ids, max_new_tokens, external_pos=None):
+        """
+        Generate tokens.
+        If external_pos=(p1, p2) is provided, use those positions.
+        Otherwise, attempt to infer next positions based on 2D logic.
+        """
+        for i in range(max_new_tokens):
             logits, _ = self(idx, pos1_ids, pos2_ids)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = torch.argmax(probs, dim=-1, keepdim=True)
+            # idx_next = torch.multinomial(probs, num_samples=1)
 
-            next_pos1 = pos1_ids[:, -1:]
-            next_pos2 = pos2_ids[:, -1:] - 1
+            if external_pos is not None:
+                p1_ext, p2_ext = external_pos
+                next_pos1 = p1_ext[:, i : i + 1]
+                next_pos2 = p2_ext[:, i : i + 1]
+            else:
+                # Infer positions
+                last_idx = idx[:, -1:]
+                last_p1 = pos1_ids[:, -1:]
+                last_p2 = pos2_ids[:, -1:]
+
+                # Default: stay in same p1, move p2
+                next_pos1 = last_p1.clone()
+                next_pos2 = last_p2.clone()
+
+                # Logic from data.py
+                # If last was '=', next p1 is 3, next p2 is 1
+                is_eq = last_idx == self.hparams.eq_token
+                next_pos1[is_eq] = 3
+                next_pos2[is_eq] = 1
+
+                # If we are in p1=3 (sum) and last was NOT '=', p2 increases
+                is_sum = (last_p1 == 3) & (~is_eq)
+                next_pos2[is_sum] += 1
+
+                # During pure generation (like spot check), we are only generating the sum.
+                # So we don't need the 'is_num' decrement logic which was for the prompt tokens themselves.
 
             idx = torch.cat((idx, idx_next), dim=1)
             pos1_ids = torch.cat((pos1_ids, next_pos1), dim=1)
             pos2_ids = torch.cat((pos2_ids, next_pos2), dim=1)
 
         return idx
-

@@ -3,6 +3,7 @@
 Features experiment isolation, validation-only mode, and length generalization tracking.
 """
 
+from math import ceil
 import os
 import torch
 import pytorch_lightning as pl
@@ -54,13 +55,28 @@ class ValidationTableCallback(Callback):
             seq_acc = get_m("val_acc_seq")
             loss = get_m("val_loss")
 
+            # MV Metrics
+            seq_mv = get_m("val_acc_seq_mv")
+            digit_mv = get_m("val_acc_digit_mv")
+
             if token_acc is not None:
-                table.add_row(
+                row = [
                     name,
                     f"{token_acc:.4f}",
                     f"{seq_acc:.4f}" if seq_acc is not None else "N/A",
                     f"{loss:.4f}" if loss is not None else "N/A",
-                )
+                ]
+
+                # Dynamically add columns for MV if they appear (only once)
+                if seq_mv is not None and len(table.columns) == 4:
+                    table.add_column("Seq MV", justify="right", style="blue")
+                    table.add_column("Digit MV", justify="right", style="yellow")
+
+                if seq_mv is not None:
+                    row.append(f"{seq_mv:.4f}")
+                    row.append(f"{digit_mv:.4f}")
+
+                table.add_row(*row)
 
         console.print(table)
 
@@ -105,6 +121,7 @@ def main():
     )
     parser.add_argument("--curriculum_start", type=int, default=3)
     parser.add_argument("--eval_interval", type=int, default=500)
+    parser.add_argument("--eval_batch_size", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--n_embd", type=int, default=256)
     parser.add_argument("--n_head", type=int, default=8)
@@ -114,10 +131,17 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--val_k",
+        type=int,
+        default=1,
+        help="Number of samples for majority voting validation.",
+    )
     parser.add_argument("--smoke-test", action="store_true")
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
+    max_pos2 = 3*args.max_val_digits
 
     # 1. Data Module
     dm = AdditionDataModule(
@@ -128,13 +152,16 @@ def main():
         batch_size=args.batch_size,
         curriculum_start=args.curriculum_start,
         num_workers=0 if args.smoke_test else args.num_workers,
+        max_pos2=max_pos2
     )
     dm.setup()
 
     # 2. Model Module
     if args.ckpt_path:
-        # Load from checkpoint with hyperparams preserved
-        model = GPTLightningModule.load_from_checkpoint(args.ckpt_path)
+        # Load from checkpoint with hyperparams preserved (override val_k)
+        model = GPTLightningModule.load_from_checkpoint(
+            args.ckpt_path, val_k=args.val_k
+        )
         print(f"✅ Loaded model from {args.ckpt_path} for validation.")
     else:
         model = GPTLightningModule(
@@ -147,9 +174,10 @@ def main():
             n_ffwd_width=args.n_ffwd_width,
             n_ffwd_depth=args.n_ffwd_depth,
             total_steps=5 if args.smoke_test else args.max_iters,
-            max_pos2=1500,
+            max_pos2=max_pos2,
             pad_token=dm.stoi["#"],
             eq_token=dm.stoi["="],
+            val_k=args.val_k,
         )
 
     # 3. Trainer Setup
@@ -169,7 +197,7 @@ def main():
     trainer_kwargs = {
         "max_steps": 5 if args.smoke_test else args.max_iters,
         "val_check_interval": 2 if args.smoke_test else args.eval_interval,
-        "limit_val_batches": 2 if args.smoke_test else 50,
+        "limit_val_batches": 2 if args.smoke_test else args.eval_batch_size,
         "limit_train_batches": 2 if args.smoke_test else args.steps_per_epoch,
         "reload_dataloaders_every_n_epochs": 1,
         "callbacks": [checkpoint_callback, lr_monitor, ValidationTableCallback()],
@@ -177,11 +205,10 @@ def main():
         "devices": 1,
         "gradient_clip_val": args.grad_clip,
         "logger": TensorBoardLogger("logs", name=args.exp_name),
-        # "compile": True,
     }
 
     trainer = pl.Trainer(**trainer_kwargs)
-    trainer.compile_model = True
+    # trainer.compile_model = True
 
     # Handle Automatic Resumption
     if not args.ckpt_path and not args.validate_only:

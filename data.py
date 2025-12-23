@@ -73,24 +73,21 @@ class VectorizedAdditionDataset(IterableDataset):
         p1_seg3 = torch.full((B, L + 1), 3, dtype=torch.long)
         pos1 = torch.cat([p1_seg1, p1_seg2, p1_seg3], dim=1)
 
-        idx_1_L = torch.arange(1, L + 1)
-        idx_1 = torch.tensor([1])
-        idx_L_0 = torch.arange(L, -1, -1)
+        idx_1_L = torch.arange(L, -1, -1)
+        idx_L_0 = torch.arange(1, L+2)
 
         pos2_seq = torch.cat(
             [
                 idx_1_L,
-                idx_1,  # n1, +
                 idx_1_L,
-                idx_1,  # n2, =
-                idx_L_0,  # sum
+                idx_L_0,
             ]
         )
 
         pos2 = pos2_seq.unsqueeze(0).expand(B, -1)  # (B, SeqLen)
 
         offsets = torch.randint(0, self.offset_range, (B, 1))
-        pos2 = pos2 + offsets
+        # pos2 = pos2 + offsets
 
         # 5. Form (x, y)
         x = tokens[:, :-1]

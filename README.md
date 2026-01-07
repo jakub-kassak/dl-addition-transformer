@@ -50,6 +50,15 @@ The Transformer FeedForward block is now parameterizable via CLI:
 - **Manual Grad Logging**: Manual logging of gradient norms and max logits for better stability monitoring.
 - **Improved Checkpointing**: Keeps the 3 best models based on `val_avg_seq_acc` (average across all validation sets), ensuring overall performance is prioritized.
 
+### 7. Positional Encodings Example
+We use two dimensional positional encodings to encode the position of each token in the input sequence.
+Example:
+```
+input: 123+ 456= 9750
+pos1:  1111 2222 3333
+pos2:  3210 3210 1234
+```
+
 ## Running Experiments
 
 ### Train 10M Param Model

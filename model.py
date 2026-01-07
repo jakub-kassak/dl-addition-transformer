@@ -37,7 +37,7 @@ class MultiHeadAttention(nn.Module):
         self.dropout_p = dropout
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, return_weights=False):
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
@@ -45,12 +45,27 @@ class MultiHeadAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        y = scaled_dot_product_attention(
-            q, k, v, dropout_p=self.dropout_p if self.training else 0, is_causal=True
-        )
+        if return_weights:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / ((C // self.n_head) ** 0.5))
+            mask = torch.tril(torch.ones(T, T, device=q.device)).view(1, 1, T, T)
+            att = att.masked_fill(mask == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            y = att @ v
+        else:
+            y = scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.dropout_p if self.training else 0,
+                is_causal=True,
+            )
+            att = None
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
+
+        if return_weights:
+            return y, att
         return y
 
 
@@ -87,10 +102,16 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
-        return x
+    def forward(self, x, return_weights=False):
+        if return_weights:
+            out, att = self.sa(self.ln1(x), return_weights=True)
+            x = x + out
+            x = x + self.ffwd(self.ln2(x))
+            return x, att
+        else:
+            x = x + self.sa(self.ln1(x))
+            x = x + self.ffwd(self.ln2(x))
+            return x
 
 
 # --- Lightning Module ---
@@ -145,7 +166,7 @@ class GPTLightningModule(pl.LightningModule):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, pos1_ids, pos2_ids, targets=None):
+    def forward(self, idx, pos1_ids, pos2_ids, targets=None, return_weights=False):
         B, T = idx.shape
 
         tok_emb = self.token_embedding_table(idx)  # (B, T, n_embd)
@@ -154,7 +175,14 @@ class GPTLightningModule(pl.LightningModule):
 
         x = tok_emb + pos1_emb + pos2_emb  # (B, T, n_embd)
 
-        x = self.blocks(x)
+        all_attn = []
+        for block in self.blocks:
+            if return_weights:
+                x, att = block(x, return_weights=True)
+                all_attn.append(att)
+            else:
+                x = block(x)
+
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
@@ -189,6 +217,8 @@ class GPTLightningModule(pl.LightningModule):
                 ignore_index=self.hparams.pad_token,
             )
 
+        if return_weights:
+            return logits, loss, all_attn
         return logits, loss
 
     def training_step(self, batch, batch_idx):
@@ -335,4 +365,3 @@ class GPTLightningModule(pl.LightningModule):
             pos2_ids = torch.cat((pos2_ids, next_pos2), dim=1)
 
         return idx
-

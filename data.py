@@ -107,6 +107,7 @@ class AdditionDataModule(pl.LightningDataModule):
         batch_size=64,
         num_workers=0,
         curriculum_start=3,
+        val_batch_size=None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -119,6 +120,9 @@ class AdditionDataModule(pl.LightningDataModule):
             self.hparams.max_train_digits,
             self.hparams.batch_size,
         )
+
+        # Validation batch size
+        self.val_bs = self.hparams.val_batch_size or self.hparams.batch_size
 
         # Validation datasets: Multiple datasets for generalization
         # Start from max_train + 1, go up to max_val
@@ -140,17 +144,13 @@ class AdditionDataModule(pl.LightningDataModule):
 
         # 1. In-distribution set
         self.val_datasets.append(
-            VectorizedAdditionDataset(
-                train_dist_val, train_dist_val, self.hparams.batch_size
-            )
+            VectorizedAdditionDataset(train_dist_val, train_dist_val, self.val_bs)
         )
         self.val_names.append(f"val_L{train_dist_val}")
 
         # 2. Generalization sets
         for L in val_lengths:
-            self.val_datasets.append(
-                VectorizedAdditionDataset(L, L, self.hparams.batch_size)
-            )
+            self.val_datasets.append(VectorizedAdditionDataset(L, L, self.val_bs))
             self.val_names.append(f"val_L{L}")
 
         self.stoi = self.train_ds.stoi
@@ -195,7 +195,7 @@ class AdditionDataModule(pl.LightningDataModule):
         dataloaders = []
         self.val_names = []  # Reset and repopulate
         for L in lengths:
-            ds = VectorizedAdditionDataset(L, L, self.hparams.batch_size)
+            ds = VectorizedAdditionDataset(L, L, self.val_bs)
             dataloaders.append(
                 DataLoader(
                     ds,

@@ -27,6 +27,10 @@ class ValidationTableCallback(Callback):
         table.add_column("Seq Accuracy", justify="right", style="magenta")
         table.add_column("Loss", justify="right", style="red")
 
+        # Markdown table construction
+        md_table = "| Dataset | Token Acc | Seq Accuracy | Loss |\n"
+        md_table += "|:---|---:|---:|---:|\n"
+
         # Get validation names from datamodule
         val_names = getattr(trainer.datamodule, "val_names", [])
         if not val_names:
@@ -35,18 +39,11 @@ class ValidationTableCallback(Callback):
         metrics = trainer.callback_metrics
 
         for i, name in enumerate(val_names):
-            # Keys are typically val_acc_token/dataloader_idx_N
-            # If there's only one dataloader, no suffix is added by PL sometimes?
-            # But we force list of dataloaders, so suffixes should exist.
-
             suffix = f"/dataloader_idx_{i}"
 
-            # Helper to safely get metric
             def get_m(key_base):
-                # Try with suffix
                 val = metrics.get(f"{key_base}{suffix}")
                 if val is None and i == 0:
-                    # Fallback for single dataloader case if it happens
                     val = metrics.get(key_base)
                 return val
 
@@ -55,14 +52,38 @@ class ValidationTableCallback(Callback):
             loss = get_m("val_loss")
 
             if token_acc is not None:
-                table.add_row(
-                    name,
-                    f"{token_acc:.4f}",
-                    f"{seq_acc:.4f}" if seq_acc is not None else "N/A",
-                    f"{loss:.4f}" if loss is not None else "N/A",
+                token_acc_val = f"{token_acc:.4f}"
+                seq_acc_val = f"{seq_acc:.4f}" if seq_acc is not None else "N/A"
+                loss_val = f"{loss:.4f}" if loss is not None else "N/A"
+
+                table.add_row(name, token_acc_val, seq_acc_val, loss_val)
+                md_table += (
+                    f"| {name} | {token_acc_val} | {seq_acc_val} | {loss_val} |\n"
                 )
 
         console.print(table)
+
+        # Log to TensorBoard
+        if hasattr(trainer.logger, "experiment") and hasattr(
+            trainer.logger.experiment, "add_text"
+        ):
+            trainer.logger.experiment.add_text(
+                "validation_table", md_table, global_step=trainer.global_step
+            )
+            print(md_table)
+
+
+class CurriculumLoggerCallback(Callback):
+    def on_train_epoch_start(self, trainer, pl_module):
+        if hasattr(trainer.datamodule, "train_ds"):
+            max_digits = trainer.datamodule.train_ds.max_digits
+            pl_module.log(
+                "curriculum/max_digits",
+                float(max_digits),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+            )
 
 
 def main():
@@ -88,6 +109,7 @@ def main():
 
     # Hyperparameters
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--val_batch_size", type=int, default=20)
     parser.add_argument(
         "--num_workers", type=int, default=4, help="Number of DataLoader workers"
     )
@@ -134,6 +156,7 @@ def main():
         max_val_digits=args.max_val_digits,
         val_step=args.val_step,
         batch_size=args.batch_size,
+        val_batch_size=args.val_batch_size,
         curriculum_start=args.curriculum_start,
         num_workers=0 if args.smoke_test else args.num_workers,
     )
@@ -181,7 +204,12 @@ def main():
         "limit_val_batches": 2 if args.smoke_test else 50,
         "limit_train_batches": 2 if args.smoke_test else args.steps_per_epoch,
         "reload_dataloaders_every_n_epochs": 1,
-        "callbacks": [checkpoint_callback, lr_monitor, ValidationTableCallback()],
+        "callbacks": [
+            checkpoint_callback,
+            lr_monitor,
+            ValidationTableCallback(),
+            CurriculumLoggerCallback(),
+        ],
         "accelerator": "auto",
         "devices": 1,
         "gradient_clip_val": args.grad_clip,

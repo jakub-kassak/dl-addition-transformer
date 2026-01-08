@@ -18,7 +18,7 @@ def inference(model, n1_str, n2_str, offset_range=10):
     device = model.device
 
     # Prepare vocab
-    chars = "0123456789+=#"
+    chars = [str(i) for i in range(20)] + ["+", "="]
     stoi = {ch: i for i, ch in enumerate(chars)}
     itos = {i: ch for i, ch in enumerate(chars)}
 
@@ -52,10 +52,14 @@ def inference(model, n1_str, n2_str, offset_range=10):
     # =: 1
     offset = random.randint(0, offset_range)
 
-    p2_n1 = [i + 1 + offset for i in range(len(n1_str))]
-    p2_plus = [1 + offset]
-    p2_n2 = [i + 1 + offset for i in range(len(n2_str))]
-    p2_eq = [1 + offset]
+    p2_n1 = [i + 1 + offset for i in range(len(n1_str))][
+        ::-1
+    ]  # 1 to L -> Reversed to L to 1
+    p2_plus = [0 + offset]
+    p2_n2 = [i + 1 + offset for i in range(len(n2_str))][
+        ::-1
+    ]  # 1 to L -> Reversed to L to 1
+    p2_eq = [0 + offset]
     p2_seq = p2_n1 + p2_plus + p2_n2 + p2_eq
     pos2 = torch.tensor(p2_seq).unsqueeze(0).to(device)
 
@@ -73,7 +77,9 @@ def inference(model, n1_str, n2_str, offset_range=10):
 
     # Next Pos2 values for generation
     # From L down to 0
-    next_pos2_vals = [i + offset for i in range(L, -1, -1)]
+    # Next Pos2 values for generation
+    # From 1 up to L+1 (LSB .. MSB)
+    next_pos2_vals = [i + offset for i in range(1, L + 2)]
 
     for step, next_p2 in enumerate(next_pos2_vals):
         # Get logits
@@ -107,10 +113,10 @@ def inference(model, n1_str, n2_str, offset_range=10):
     print(f"Result (Reversed): {''.join(result_digits)}")
 
     # Reverse back to normal number
-    final_res = "".join(result_digits).rstrip(
-        "#"
-    )  # remove padding if any (though we assume digits)
-    final_res = int(final_res[::-1])
+    # result_digits contains raw tokens as strings (from itos)
+    # Convert them to int % 10 then back to string for joining
+    final_res_str = "".join([str(int(d) % 10) for d in result_digits])
+    final_res = int(final_res_str[::-1])
     correct_res = int(n1_str) + int(n2_str)
     print(f"Final Answer:   {final_res}")
     print(f"Correct Answer: {correct_res}")

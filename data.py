@@ -18,11 +18,10 @@ class VectorizedAdditionDataset(IterableDataset):
         self.batch_size = batch_size
         self.offset_range = offset_range
 
-        self.chars = "0123456789+=#"
+        self.chars = [str(i) for i in range(20)] + ["+", "="]
         self.stoi = {ch: i for i, ch in enumerate(self.chars)}
         self.itos = {i: ch for i, ch in enumerate(self.chars)}
         self.vocab_size = len(self.chars)
-        self.pad_token = self.stoi["#"]
 
         # Pre-compute token IDs for special chars
         self.plus_token = self.stoi["+"]
@@ -45,15 +44,14 @@ class VectorizedAdditionDataset(IterableDataset):
         # We process from LSB (index L-1) to MSB (index 0)
         # Result s will have length L+1 to accommodate final carry
         s_digits_rev = []  # Stores digits from LSB to MSB
-        carry = torch.zeros(B, dtype=torch.long)
+        carry = torch.zeros(B, dtype=torch.short)
 
         for i in range(L - 1, -1, -1):
             d1 = n1_digits[:, i]
             d2 = n2_digits[:, i]
             total = d1 + d2 + carry
-            rem = total % 10
             carry = total // 10
-            s_digits_rev.append(rem)
+            s_digits_rev.append(total)
 
         # Final carry becomes the MSB of the sum
         s_digits_rev.append(carry)
@@ -75,7 +73,7 @@ class VectorizedAdditionDataset(IterableDataset):
         pos1 = torch.cat([p1_seg1, p1_seg2, p1_seg3], dim=1)
 
         idx_1_L = torch.arange(L, -1, -1)
-        idx_L_0 = torch.arange(1, L+3)
+        idx_L_0 = torch.arange(1, L + 3)
 
         pos2_seq = torch.cat(
             [
@@ -112,7 +110,7 @@ class AdditionDataModule(pl.LightningDataModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.vocab_size = 13
+        self.vocab_size = 22
 
     def setup(self, stage=None):
         # Training dataset: range [min_train, max_train]

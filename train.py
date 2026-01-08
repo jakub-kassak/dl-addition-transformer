@@ -156,7 +156,6 @@ def main():
             n_ffwd_depth=args.n_ffwd_depth,
             total_steps=5 if args.smoke_test else args.max_iters,
             max_pos2=1500,
-            pad_token=dm.stoi["#"],
             eq_token=dm.stoi["="],
             rope_theta=args.rope_theta,
             pos_emb_type=args.pos_emb_type,
@@ -212,8 +211,22 @@ def main():
         batch = next(iter(dm.train_dataloader()))
         x, y, p1, p2 = batch
         print(f"\n--- Training Experiment: {args.exp_name} ---")
-        decode = lambda l: "".join([dm.itos[i.item()] for i in l])
-        print(f"Sample Input: {decode(x[0])}")
+
+        def decode_and_mod(l):
+            return "".join(
+                [
+                    str(dm.itos[i.item()])
+                    if not isinstance(dm.itos[i.item()], str)
+                    or not dm.itos[i.item()].isdigit()
+                    else str(int(dm.itos[i.item()]) % 10)
+                    for i in l
+                ]
+            )
+
+        # Simple decode for debugging raw tokens
+        decode_raw = lambda l: "".join([f"[{dm.itos[i.item()]}]" for i in l])
+        print(f"Sample Input (mod 10): {decode_and_mod(x[0])}")
+        print(f"Sample Input (raw):    {decode_raw(x[0])}")
         print("---------------------------\n")
 
         trainer.fit(model, datamodule=dm, ckpt_path=args.ckpt_path)
@@ -239,9 +252,20 @@ def main():
         p2_in = torch.tensor([p2], dtype=torch.long)
 
         generated = model.generate(x_in, p1_in, p2_in, max_new_tokens=L + 1)
-        decode = lambda l: "".join([dm.itos[i.item()] for i in l])
+
+        # Improved decoding for 0-19 digits
+        def decode_mod10(l):
+            res = []
+            for i in l:
+                token = dm.itos[i.item()]
+                if token in ["+", "="]:
+                    res.append(token)
+                else:
+                    res.append(str(int(token) % 10))
+            return "".join(res)
+
         print(f"Prompt: {prompt_str}")
-        print(f"Output: {decode(generated[0][len(tokens) :])}")
+        print(f"Output: {decode_mod10(generated[0][len(tokens) :])}")
 
 
 if __name__ == "__main__":

@@ -116,6 +116,13 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--rope_theta", type=float, default=40000)
+    parser.add_argument(
+        "--pos_emb_type",
+        type=str,
+        default="rope",
+        choices=["rope", "learned", "abc_mixed"],
+        help="Type of positional embedding to use.",
+    )
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -152,6 +159,7 @@ def main():
             pad_token=dm.stoi["#"],
             eq_token=dm.stoi["="],
             rope_theta=args.rope_theta,
+            pos_emb_type=args.pos_emb_type,
         )
 
     # 3. Trainer Setup

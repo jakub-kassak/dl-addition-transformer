@@ -46,14 +46,38 @@ class MultiHeadAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
         if rope is not None:
-            # dtype = q.dtype
-            shape = q.shape
-            q = q.reshape(*shape[:-1], -1, 1, 2)
-            k = k.reshape(*shape[:-1], -1, 1, 2)
-            q = rope[..., 0] * q[..., 0] + rope[..., 1] * q[..., 1]
-            k = rope[..., 0] * k[..., 0] + rope[..., 1] * k[..., 1]
-            q = q.reshape(shape)
-            k = k.reshape(shape)
+            # rope shape: (B, 1, T, head_size//2, 2, 2)
+            # q, k shape: (B, n_head, T, head_size)
+            shape = q.shape  # (B, n_head, T, head_size)
+
+            # Reshape q, k for RoPE: [B, n_head, T, head_size//2, 2]
+            q_rot = q.view(*shape[:-1], -1, 2)
+            k_rot = k.view(*shape[:-1], -1, 2)
+
+            # rope is (B, 1, T, head_size//2, 2, 2)
+            # We want [x*cos - y*sin, x*sin + y*cos]
+            # cos/sin shape: (B, 1, T, head_size//2)
+            # To multiply (B, n_head, T, head_size//2, 2) by (B, 1, T, head_size//2),
+            # we need to unsqueeze cos/sin to (B, 1, T, head_size//2, 1)
+            # q_rot:      (B, n_head, T, head_size//2, 2)
+            # cos/sin:    (B, 1, T, head_size//2, 1) -> broadcasting works
+            cos = rope[..., 0, 0].unsqueeze(-1)
+            sin = rope[..., 1, 0].unsqueeze(-1)
+
+            x_raw = q_rot[..., 0:1]
+            y_raw = q_rot[..., 1:2]
+
+            q_new = torch.cat(
+                [x_raw * cos - y_raw * sin, x_raw * sin + y_raw * cos], dim=-1
+            )
+
+            x_k = k_rot[..., 0:1]
+            y_k = k_rot[..., 1:2]
+            k_new = torch.cat([x_k * cos - y_k * sin, x_k * sin + y_k * cos], dim=-1)
+
+            # Reshape back to (B, n_head, T, head_size)
+            q = q_new.view(shape)
+            k = k_new.view(shape)
 
         if return_weights:
             att = (q @ k.transpose(-2, -1)) * (1.0 / ((C // self.n_head) ** 0.5))
@@ -111,7 +135,7 @@ class Block(nn.Module):
         self.ffwd = FeedFoward(n_embd, dropout, n_ffwd_width, n_ffwd_depth)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
-    
+
     def forward(self, x, return_weights=False, rope=None):
         if return_weights:
             out, att = self.sa(self.ln1(x), return_weights=True, rope=rope)
@@ -143,12 +167,23 @@ class GPTLightningModule(pl.LightningModule):
         pad_token=-1,
         eq_token=-1,
         rope_theta=20000,
+        pos_emb_type="rope",
     ):
         super().__init__()
         self.save_hyperparameters()
         self.theta = rope_theta
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+
+        if pos_emb_type == "learned":
+            # 2D Positional Embeddings
+            # pos1 range: 0 (pad), 1, 2, 3
+            self.pos1_embedding_table = nn.Embedding(4, n_embd)
+            # pos2 range: randomized offset + digit index + padding (0)
+            self.pos2_embedding_table = nn.Embedding(max_pos2, n_embd)
+        elif pos_emb_type == "abc_mixed":
+            # pos1 is learned absolute PE
+            self.pos1_embedding_table = nn.Embedding(4, n_embd)
 
         self.blocks = nn.Sequential(
             *[
@@ -174,26 +209,50 @@ class GPTLightningModule(pl.LightningModule):
 
     def rope(self, pos, head_size):
         assert head_size % 2 == 0
-        scale = torch.arange(0, head_size, 2, dtype=pos.dtype, device=pos. device) / head_size
-        radians = 1. / (self.theta ** scale)
+        scale = (
+            torch.arange(0, head_size, 2, dtype=pos.dtype, device=pos.device)
+            / head_size
+        )
+        radians = 1.0 / (self.theta**scale)
         out = torch.einsum("...n,d->...nd", pos, radians)
         cos, sin = torch.cos(out), torch.sin(out)
         out = torch.stack([cos, -sin, sin, cos], dim=-1)
         out = out.reshape(*out.shape[:-1], 2, 2)
         return out
-    
+
     def prepare_rope(self, pos1_ids, pos2_ids):
-        head_size = self.hparams.n_embd // self.hparams.n_head // 4
-        rope1 = self.rope(pos1_ids, head_size)
-        rope2 = self.rope(pos2_ids, head_size)
-        rope = torch.cat([rope1, rope2, rope1, rope2], dim=-3)
-        return rope.unsqueeze(1)
+        head_size = self.hparams.n_embd // self.hparams.n_head
+        # Original rope: split head into 4 parts: [pos1, pos2, pos1, pos2]
+        # Each part has head_size // 4 dimension
+        rope1 = self.rope(pos1_ids, head_size // 4)
+        rope2 = self.rope(pos2_ids, head_size // 4)
+        # Cat along the head_size dimension (before the 2x2 matrix)
+        rope = torch.cat(
+            [rope1, rope2, rope1, rope2], dim=-3
+        )  # (B, T, head_size//2, 2, 2)
+        return rope.unsqueeze(1)  # (B, 1, T, head_size//2, 2, 2)
 
     def forward(self, idx, pos1_ids, pos2_ids, targets=None, return_weights=False):
         B, T = idx.shape
 
         x = self.token_embedding_table(idx)  # (B, T, n_embd)
-        rope = self.prepare_rope(pos1_ids, pos2_ids)
+
+        rope = None
+        if self.hparams.pos_emb_type == "rope":
+            rope = self.prepare_rope(pos1_ids, pos2_ids)
+        elif self.hparams.pos_emb_type == "learned":
+            pos1_emb = self.pos1_embedding_table(pos1_ids)  # (B, T, n_embd)
+            pos2_emb = self.pos2_embedding_table(pos2_ids)  # (B, T, n_embd)
+            x = x + pos1_emb + pos2_emb  # (B, T, n_embd)
+        elif self.hparams.pos_emb_type == "abc_mixed":
+            # pos1 is added as learned absolute PE
+            pos1_emb = self.pos1_embedding_table(pos1_ids)  # (B, T, n_embd)
+            x = x + pos1_emb
+            # pos2 is RoPE spanning the entire head dimension
+            head_size = self.hparams.n_embd // self.hparams.n_head
+            rope = self.rope(pos2_ids, head_size).unsqueeze(
+                1
+            )  # (B, 1, T, head_size//2, 2, 2)
 
         all_attn = []
         for block in self.blocks:

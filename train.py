@@ -115,6 +115,7 @@ def main():
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--rope_theta", type=float, default=40000)
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -150,6 +151,7 @@ def main():
             max_pos2=1500,
             pad_token=dm.stoi["#"],
             eq_token=dm.stoi["="],
+            rope_theta=args.rope_theta,
         )
 
     # 3. Trainer Setup

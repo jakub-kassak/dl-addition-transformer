@@ -37,13 +37,23 @@ class MultiHeadAttention(nn.Module):
         self.dropout_p = dropout
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, x, return_weights=False):
+    def forward(self, x, return_weights=False, rope=None):
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        if rope is not None:
+            # dtype = q.dtype
+            shape = q.shape
+            q = q.reshape(*shape[:-1], -1, 1, 2)
+            k = k.reshape(*shape[:-1], -1, 1, 2)
+            q = rope[..., 0] * q[..., 0] + rope[..., 1] * q[..., 1]
+            k = rope[..., 0] * k[..., 0] + rope[..., 1] * k[..., 1]
+            q = q.reshape(shape)
+            k = k.reshape(shape)
 
         if return_weights:
             att = (q @ k.transpose(-2, -1)) * (1.0 / ((C // self.n_head) ** 0.5))
@@ -101,15 +111,15 @@ class Block(nn.Module):
         self.ffwd = FeedFoward(n_embd, dropout, n_ffwd_width, n_ffwd_depth)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
-
-    def forward(self, x, return_weights=False):
+    
+    def forward(self, x, return_weights=False, rope=None):
         if return_weights:
-            out, att = self.sa(self.ln1(x), return_weights=True)
+            out, att = self.sa(self.ln1(x), return_weights=True, rope=rope)
             x = x + out
             x = x + self.ffwd(self.ln2(x))
             return x, att
         else:
-            x = x + self.sa(self.ln1(x))
+            x = x + self.sa(self.ln1(x), rope=rope)
             x = x + self.ffwd(self.ln2(x))
             return x
 
@@ -132,17 +142,13 @@ class GPTLightningModule(pl.LightningModule):
         max_pos2=1500,
         pad_token=-1,
         eq_token=-1,
+        rope_theta=20000,
     ):
         super().__init__()
         self.save_hyperparameters()
+        self.theta = rope_theta
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-
-        # 2D Positional Embeddings
-        # pos1 range: 0 (pad), 1, 2, 3
-        self.pos1_embedding_table = nn.Embedding(4, n_embd)
-        # pos2 range: randomized offset + digit index + padding (0)
-        self.pos2_embedding_table = nn.Embedding(max_pos2, n_embd)
 
         self.blocks = nn.Sequential(
             *[
@@ -166,22 +172,36 @@ class GPTLightningModule(pl.LightningModule):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def rope(self, pos, head_size):
+        assert head_size % 2 == 0
+        scale = torch.arange(0, head_size, 2, dtype=pos.dtype, device=pos. device) / head_size
+        radians = 1. / (self.theta ** scale)
+        out = torch.einsum("...n,d->...nd", pos, radians)
+        cos, sin = torch.cos(out), torch.sin(out)
+        out = torch.stack([cos, -sin, sin, cos], dim=-1)
+        out = out.reshape(*out.shape[:-1], 2, 2)
+        return out
+    
+    def prepare_rope(self, pos1_ids, pos2_ids):
+        head_size = self.hparams.n_embd // self.hparams.n_head // 4
+        rope1 = self.rope(pos1_ids, head_size)
+        rope2 = self.rope(pos2_ids, head_size)
+        rope = torch.cat([rope1, rope2, rope1, rope2], dim=-3)
+        return rope.unsqueeze(1)
+
     def forward(self, idx, pos1_ids, pos2_ids, targets=None, return_weights=False):
         B, T = idx.shape
 
-        tok_emb = self.token_embedding_table(idx)  # (B, T, n_embd)
-        pos1_emb = self.pos1_embedding_table(pos1_ids)  # (B, T, n_embd)
-        pos2_emb = self.pos2_embedding_table(pos2_ids)  # (B, T, n_embd)
-
-        x = tok_emb + pos1_emb + pos2_emb  # (B, T, n_embd)
+        x = self.token_embedding_table(idx)  # (B, T, n_embd)
+        rope = self.prepare_rope(pos1_ids, pos2_ids)
 
         all_attn = []
         for block in self.blocks:
             if return_weights:
-                x, att = block(x, return_weights=True)
+                x, att = block(x, return_weights=True, rope=rope)
                 all_attn.append(att)
             else:
-                x = block(x)
+                x = block(x, rope=rope)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)

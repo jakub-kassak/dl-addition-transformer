@@ -57,6 +57,7 @@ class VectorizedAdditionDataset(IterableDataset):
 
         # Final carry becomes the MSB of the sum
         s_digits_rev.append(carry)
+        s_digits_rev.append(torch.zeros(B, dtype=torch.long))
 
         # s_digits_rev is ALREADY [LSB, ..., MSB], which matches the target reversed sum order.
         s_digits = torch.stack(s_digits_rev, dim=1)  # (B, L+1)
@@ -70,11 +71,11 @@ class VectorizedAdditionDataset(IterableDataset):
         # 4. Construct Positional Batch
         p1_seg1 = torch.full((B, L + 1), 1, dtype=torch.long)
         p1_seg2 = torch.full((B, L + 1), 2, dtype=torch.long)
-        p1_seg3 = torch.full((B, L + 1), 3, dtype=torch.long)
+        p1_seg3 = torch.full((B, L + 2), 3, dtype=torch.long)
         pos1 = torch.cat([p1_seg1, p1_seg2, p1_seg3], dim=1)
 
         idx_1_L = torch.arange(L, -1, -1)
-        idx_L_0 = torch.arange(1, L+2)
+        idx_L_0 = torch.arange(1, L+3)
 
         pos2_seq = torch.cat(
             [
@@ -87,7 +88,7 @@ class VectorizedAdditionDataset(IterableDataset):
         pos2 = pos2_seq.unsqueeze(0).expand(B, -1)  # (B, SeqLen)
 
         offsets = torch.randint(0, self.offset_range, (B, 1))
-        # pos2 = pos2 + offsets
+        pos2 = pos2 + offsets
 
         # 5. Form (x, y)
         x = tokens[:, :-1]

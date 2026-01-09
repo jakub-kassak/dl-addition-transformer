@@ -73,17 +73,87 @@ class ValidationTableCallback(Callback):
             print(md_table)
 
 
+def print_data_sample(dm, max_digits, debug_data=False, prefix=""):
+    from data import VectorizedAdditionDataset
+
+    temp_ds = VectorizedAdditionDataset(
+        dm.hparams.min_train_digits,
+        max_digits,
+        batch_size=1,
+        offset_range=100,
+        random_offsets=dm.hparams.random_offsets,
+    )
+    batch = temp_ds.generate_batch()
+    x, y, p1, p2 = batch
+
+    if prefix:
+        print(f"\n--- {prefix} ---")
+
+    def decode_and_mod(l):
+        return "".join(
+            [
+                str(dm.itos[i.item()])
+                if not isinstance(dm.itos[i.item()], str)
+                or not dm.itos[i.item()].isdigit()
+                else str(int(dm.itos[i.item()]) % 10)
+                for i in l
+            ]
+        )
+
+    # Simple decode for debugging raw tokens
+    decode_raw = lambda l: "".join([f"[{dm.itos[i.item()]}]" for i in l])
+    print(f"Sample Input (mod 10): {decode_and_mod(x[0])}")
+    print(f"Sample Input (raw):    {decode_raw(x[0])}")
+
+    if debug_data:
+        print(f"Sample Pos1:           {p1[0].tolist()}")
+        print(f"Sample Pos2:           {p2[0].tolist()}")
+        print("\nDetailed Token-Position alignment:")
+        tokens_str = [f"{dm.itos[i.item()]}" for i in x[0]]
+        p1_str = [str(p.item()) for p in p1[0]]
+        p2_str = [str(p.item()) for p in p2[0]]
+
+        # Simple alignment
+        for t, p1_v, p2_v in zip(tokens_str, p1_str, p2_str):
+            print(f"  Token: {t:4} | Pos1: {p1_v} | Pos2: {p2_v}")
+
+    print("---------------------------\n")
+
+
 class CurriculumLoggerCallback(Callback):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.last_max = -1
+
     def on_train_epoch_start(self, trainer, pl_module):
-        if hasattr(trainer.datamodule, "train_ds"):
-            max_digits = trainer.datamodule.train_ds.max_digits
+        dm = trainer.datamodule
+        if hasattr(dm, "train_ds"):
+            # Update Curriculum
+            current_epoch = trainer.current_epoch
+            new_max = min(
+                dm.hparams.curriculum_start + current_epoch, dm.hparams.max_train_digits
+            )
+            dm.train_ds.max_digits = new_max
+
+            # Log to TensorBoard
             pl_module.log(
                 "curriculum/max_digits",
-                float(max_digits),
+                float(new_max),
                 on_step=False,
                 on_epoch=True,
                 prog_bar=True,
             )
+
+            # Print sample if curriculum advanced OR if debug_data is enabled
+            if new_max != self.last_max or self.args.debug_data:
+                print_data_sample(
+                    dm,
+                    new_max,
+                    debug_data=self.args.debug_data,
+                    prefix=f"Training Epoch {current_epoch} (max_digits={new_max})",
+                )
+                self.last_max = new_max
 
 
 def main():
@@ -110,6 +180,11 @@ def main():
     # Hyperparameters
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--val_batch_size", type=int, default=20)
+    parser.add_argument(
+        "--debug_data",
+        action="store_true",
+        help="Print detailed data samples (inputs, pos1, pos2) before training.",
+    )
     parser.add_argument(
         "--num_workers", type=int, default=4, help="Number of DataLoader workers"
     )
@@ -145,6 +220,12 @@ def main():
         choices=["rope", "learned", "abc_mixed"],
         help="Type of positional embedding to use.",
     )
+    parser.add_argument(
+        "--random_offsets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable random positional offsets for pos2.",
+    )
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -159,6 +240,7 @@ def main():
         val_batch_size=args.val_batch_size,
         curriculum_start=args.curriculum_start,
         num_workers=0 if args.smoke_test else args.num_workers,
+        random_offsets=args.random_offsets,
     )
     dm.setup()
 
@@ -208,7 +290,7 @@ def main():
             checkpoint_callback,
             lr_monitor,
             ValidationTableCallback(),
-            CurriculumLoggerCallback(),
+            CurriculumLoggerCallback(args),
         ],
         "accelerator": "auto",
         "devices": 1,
@@ -235,27 +317,13 @@ def main():
             raise ValueError("Must provide --ckpt_path when using --validate_only.")
         trainer.validate(model, datamodule=dm, ckpt_path=args.ckpt_path)
     else:
-        # Debug print
-        batch = next(iter(dm.train_dataloader()))
-        x, y, p1, p2 = batch
-        print(f"\n--- Training Experiment: {args.exp_name} ---")
-
-        def decode_and_mod(l):
-            return "".join(
-                [
-                    str(dm.itos[i.item()])
-                    if not isinstance(dm.itos[i.item()], str)
-                    or not dm.itos[i.item()].isdigit()
-                    else str(int(dm.itos[i.item()]) % 10)
-                    for i in l
-                ]
-            )
-
-        # Simple decode for debugging raw tokens
-        decode_raw = lambda l: "".join([f"[{dm.itos[i.item()]}]" for i in l])
-        print(f"Sample Input (mod 10): {decode_and_mod(x[0])}")
-        print(f"Sample Input (raw):    {decode_raw(x[0])}")
-        print("---------------------------\n")
+        # Initial debug print
+        print_data_sample(
+            dm,
+            min(dm.hparams.curriculum_start, dm.hparams.max_train_digits),
+            debug_data=args.debug_data,
+            prefix=f"Initial State Experiment: {args.exp_name}",
+        )
 
         trainer.fit(model, datamodule=dm, ckpt_path=args.ckpt_path)
 

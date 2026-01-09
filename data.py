@@ -11,12 +11,15 @@ class VectorizedAdditionDataset(IterableDataset):
     n1, n2 are L-digit numbers (or smaller padded).
     """
 
-    def __init__(self, min_digits, max_digits, batch_size, offset_range=100):
+    def __init__(
+        self, min_digits, max_digits, batch_size, offset_range=100, random_offsets=True
+    ):
         super().__init__()
         self.min_digits = min_digits
         self.max_digits = max_digits
         self.batch_size = batch_size
         self.offset_range = offset_range
+        self.random_offsets = random_offsets
 
         self.chars = [str(i) for i in range(20)] + ["+", "="]
         self.stoi = {ch: i for i, ch in enumerate(self.chars)}
@@ -85,8 +88,9 @@ class VectorizedAdditionDataset(IterableDataset):
 
         pos2 = pos2_seq.unsqueeze(0).expand(B, -1)  # (B, SeqLen)
 
-        offsets = torch.randint(0, self.offset_range, (B, 1))
-        pos2 = pos2 + offsets
+        if self.random_offsets:
+            offsets = torch.randint(0, self.offset_range, (B, 1))
+            pos2 = pos2 + offsets
 
         # 5. Form (x, y)
         x = tokens[:, :-1]
@@ -108,6 +112,7 @@ class AdditionDataModule(pl.LightningDataModule):
         num_workers=0,
         curriculum_start=3,
         val_batch_size=None,
+        random_offsets=True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -119,7 +124,13 @@ class AdditionDataModule(pl.LightningDataModule):
             self.hparams.min_train_digits,
             self.hparams.max_train_digits,
             self.hparams.batch_size,
+            random_offsets=self.hparams.random_offsets,
         )
+
+        # Normalize curriculum start immediately
+        # This ensures setup() results are consistent regardless of max_train_digits
+        initial_max = min(self.hparams.curriculum_start, self.hparams.max_train_digits)
+        self.train_ds.max_digits = initial_max
 
         # Validation batch size
         self.val_bs = self.hparams.val_batch_size or self.hparams.batch_size
@@ -144,13 +155,22 @@ class AdditionDataModule(pl.LightningDataModule):
 
         # 1. In-distribution set
         self.val_datasets.append(
-            VectorizedAdditionDataset(train_dist_val, train_dist_val, self.val_bs)
+            VectorizedAdditionDataset(
+                train_dist_val,
+                train_dist_val,
+                self.val_bs,
+                random_offsets=self.hparams.random_offsets,
+            )
         )
         self.val_names.append(f"val_L{train_dist_val}")
 
         # 2. Generalization sets
         for L in val_lengths:
-            self.val_datasets.append(VectorizedAdditionDataset(L, L, self.val_bs))
+            self.val_datasets.append(
+                VectorizedAdditionDataset(
+                    L, L, self.val_bs, random_offsets=self.hparams.random_offsets
+                )
+            )
             self.val_names.append(f"val_L{L}")
 
         self.stoi = self.train_ds.stoi
@@ -160,19 +180,6 @@ class AdditionDataModule(pl.LightningDataModule):
         return DataLoader(
             self.train_ds, batch_size=None, num_workers=self.hparams.num_workers
         )
-
-    def on_train_epoch_start(self):
-        # Curriculum: At epoch 0, max_digits = curriculum_start
-        # Each epoch increases max_digits by 1 until max_train_digits
-        current_epoch = self.trainer.current_epoch
-        new_max = min(
-            self.hparams.curriculum_start + current_epoch, self.hparams.max_train_digits
-        )
-        self.train_ds.max_digits = new_max
-        print("\n" + "=" * 50)
-        print(f"🚀 CURRICULUM UPDATE: Epoch {current_epoch}")
-        print(f"   Training range: 1-{new_max} digits")
-        print("=" * 50 + "\n")
 
     def val_dataloader(self):
         # Dynamic validation sets based on current curriculum progress
@@ -195,7 +202,9 @@ class AdditionDataModule(pl.LightningDataModule):
         dataloaders = []
         self.val_names = []  # Reset and repopulate
         for L in lengths:
-            ds = VectorizedAdditionDataset(L, L, self.val_bs)
+            ds = VectorizedAdditionDataset(
+                L, L, self.val_bs, random_offsets=self.hparams.random_offsets
+            )
             dataloaders.append(
                 DataLoader(
                     ds,

@@ -436,8 +436,14 @@ class GPTLightningModule(pl.LightningModule):
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
 
-            next_pos1 = pos1_ids[:, -1:]
-            next_pos2 = pos2_ids[:, -1:] - 1
+            # Results use pos1=3 and increasing pos2 starting from 1
+            next_pos1 = torch.full_like(pos1_ids[:, -1:], 3)
+            # If the last token was '=', we start result pos2 at 1.
+            # Otherwise, we increment the previous result pos2.
+            is_eq = idx[:, -1:] == self.hparams.eq_token
+            next_pos2 = torch.where(
+                is_eq, torch.ones_like(pos2_ids[:, -1:]), pos2_ids[:, -1:] + 1
+            )
 
             idx = torch.cat((idx, idx_next), dim=1)
             pos1_ids = torch.cat((pos1_ids, next_pos1), dim=1)

@@ -238,11 +238,12 @@ def main():
         model.to("cpu")
 
         n1_str, n2_str = "123", "456"
-        L = len(n1_str)
+        L1, L2 = len(n1_str), len(n2_str)
         prompt_str = f"{n1_str}+{n2_str}="
         tokens = [dm.stoi[c] for c in prompt_str]
-        p1 = ([1] * (L + 1)) + ([2] * (L + 1))
-        p2 = list(range(1, L + 1)) + [1] + list(range(1, L + 1)) + [1]
+        p1 = ([1] * (L1 + 1)) + ([2] * (L2 + 1))
+        # Significance IDs: decreasing from MSB to LSB (+) or (=)
+        p2 = list(range(L1, -1, -1)) + list(range(L2, -1, -1))
 
         offset = 50
         p2 = [p + offset for p in p2]

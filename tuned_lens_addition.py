@@ -88,9 +88,9 @@ class TunedLens:
         self.n_layer = self.model.hparams.n_layer
         self.n_embd = self.model.hparams.n_embd
 
-        # Translators for each layer
+        # Translators for each layer (including embedding layer at index 0)
         self.translators = nn.ModuleList(
-            [TunedLensTranslator(self.n_embd) for _ in range(self.n_layer)]
+            [TunedLensTranslator(self.n_embd) for _ in range(self.n_layer + 1)]
         ).to(device)
 
         self.is_trained = False
@@ -113,20 +113,32 @@ class TunedLens:
         """
         # We need to ensure we don't compute gradients for the main model
         with torch.no_grad():
-            tok_emb = self.model.token_embedding_table(idx)
-            pos1_emb = self.model.pos1_embedding_table(pos1_ids)
+            x = self.model.token_embedding_table(idx)  # (B, T, n_embd)
 
-            # Bound Check for pos2 to avoid IndexError
-            max_p2 = self.model.pos2_embedding_table.num_embeddings
-            if (pos2_ids >= max_p2).any() or (pos2_ids < 0).any():
-                pos2_ids = torch.clamp(pos2_ids, 0, max_p2 - 1)
+            rope = None
+            if self.model.hparams.pos_emb_type == "rope":
+                rope = self.model.prepare_rope(pos1_ids, pos2_ids)
+            elif self.model.hparams.pos_emb_type == "learned":
+                pos1_emb = self.model.pos1_embedding_table(pos1_ids)  # (B, T, n_embd)
+                # Bound Check for pos2 to avoid IndexError
+                max_p2 = self.model.pos2_embedding_table.num_embeddings
+                if (pos2_ids >= max_p2).any() or (pos2_ids < 0).any():
+                    pos2_ids = torch.clamp(pos2_ids, 0, max_p2 - 1)
+                pos2_emb = self.model.pos2_embedding_table(pos2_ids)  # (B, T, n_embd)
+                x = x + pos1_emb + pos2_emb  # (B, T, n_embd)
+            elif self.model.hparams.pos_emb_type == "abc_mixed":
+                # pos1 is added as learned absolute PE
+                pos1_emb = self.model.pos1_embedding_table(pos1_ids)  # (B, T, n_embd)
+                x = x + pos1_emb
+                # pos2 is RoPE spanning the entire head dimension
+                head_size = self.model.hparams.n_embd // self.model.hparams.n_head
+                rope = self.model.rope(pos2_ids, head_size).unsqueeze(
+                    1
+                )  # (B, 1, T, head_size//2, 2, 2)
 
-            pos2_emb = self.model.pos2_embedding_table(pos2_ids)
-            x = tok_emb + pos1_emb + pos2_emb
-
-            hidden_states = []
+            hidden_states = [x]  # Add embedding layer at index 0
             for block in self.model.blocks:
-                x = block(x)
+                x = block(x, rope=rope)
                 hidden_states.append(x)
 
             # Final logits
@@ -194,7 +206,7 @@ class TunedLens:
             for opt in optimizers:
                 opt.zero_grad()
 
-            for l in range(self.n_layer):
+            for l in range(self.n_layer + 1):
                 h_l = h_list[l].detach()  # Important: detach from main model graph
 
                 # Forward pass through translator
@@ -209,7 +221,7 @@ class TunedLens:
                 total_loss += loss_l
 
             # Backward
-            avg_loss = total_loss / self.n_layer
+            avg_loss = total_loss / (self.n_layer + 1)
             avg_loss.backward()
 
             # Step
@@ -254,14 +266,19 @@ class TunedLens:
             torch.save(self.translators.state_dict(), self.save_path)
 
     @torch.no_grad()
-    def visualize_trajectory(self, equation, theoretical_no_carry=False):
+    def visualize_trajectory(
+        self,
+        equation,
+        stoi,
+        itos,
+        method="tuned",
+        theoretical_no_carry=False,
+        show_probs=False,
+        top_k=1,
+    ):
         """
         visualize the trajectory of predictions across layers.
         """
-        # Prepare input
-        chars = "0123456789+=#"
-        stoi = {ch: i for i, ch in enumerate(chars)}
-        itos = {i: ch for i, ch in enumerate(chars)}
 
         # Split equation to get n1 and n2
         if "=" in equation:
@@ -272,18 +289,19 @@ class TunedLens:
         n1_str, n2_str = prompt.split("+")
         n2_str = n2_str.replace("=", "")
 
-        L = len(n1_str)
+        L1 = len(n1_str)
+        L2 = len(n2_str)
         tokens = [stoi[c] for c in prompt]
 
         # Reconstruction of pos2 for prompt:
         # n1 digits + plus
-        p2_n1_plus = list(range(L, -1, -1))
+        p2_n1_plus = list(range(L1, -1, -1))
         # n2 digits + eq
-        p2_n2_eq = list(range(L, -1, -1))
+        p2_n2_eq = list(range(L2, -1, -1))
         p2 = p2_n1_plus + p2_n2_eq
 
         # p1 logic
-        p1 = ([1] * (L + 1)) + ([2] * (L + 1))
+        p1 = ([1] * (L1 + 1)) + ([2] * (L2 + 1))
 
         # Use offset=0 for visualization to avoid running out of embedding table range
         offset = 0
@@ -294,7 +312,7 @@ class TunedLens:
         p2_in = torch.tensor([p2], device=self.device)
 
         # We need to generate the result tokens to see the trajectory over the result
-        max_gen = L + 1
+        max_gen = max(L1, L2) + 1
         curr_idx = idx_in
         curr_p1 = p1_in
         curr_p2 = p2_in
@@ -307,22 +325,52 @@ class TunedLens:
             # We are interested in the last position's predictions
             step_results = {}
 
-            # Layers
-            for l in range(self.n_layer):
+            # Layers (including Layer -1)
+            for l in range(self.n_layer + 1):
                 h_l_last = h_list[l][:, -1, :]
-                h_hat = self.translators[l](h_l_last)
-                logits = self.model.lm_head(self.model.ln_f(h_hat))
-                top_token = torch.argmax(logits, dim=-1).item()
-                step_results[f"Layer {l}"] = itos[top_token]
+                if method == "tuned":
+                    h_hat = self.translators[l](h_l_last)
+                    logits = self.model.lm_head(self.model.ln_f(h_hat))
+                else:  # logit lens
+                    logits = self.model.lm_head(self.model.ln_f(h_l_last))
+
+                probs = F.softmax(logits, dim=-1)
+
+                # Get Top K
+                top_v, top_i = torch.topk(probs, k=min(top_k, probs.size(-1)), dim=-1)
+                top_v = top_v[0].tolist()
+                top_i = top_i[0].tolist()
+
+                layer_label = f"Layer {l - 1}" if l > 0 else "Layer -1"
+
+                if top_k > 1:
+                    lines = [f"{itos[idx]} ({p:.1%})" for p, idx in zip(top_v, top_i)]
+                    step_results[layer_label] = "\n".join(lines)
+                elif show_probs:
+                    step_results[layer_label] = f"{itos[top_i[0]]} ({top_v[0]:.1%})"
+                else:
+                    step_results[layer_label] = itos[top_i[0]]
 
             # Final output
-            final_top_token = torch.argmax(final_logits[:, -1, :], dim=-1).item()
-            step_results["Final"] = itos[final_top_token]
+            final_probs = F.softmax(final_logits[:, -1, :], dim=-1)
+            f_v, f_i = torch.topk(
+                final_probs, k=min(top_k, final_probs.size(-1)), dim=-1
+            )
+            f_v = f_v[0].tolist()
+            f_i = f_i[0].tolist()
+
+            if top_k > 1:
+                lines = [f"{itos[idx]} ({p:.1%})" for p, idx in zip(f_v, f_i)]
+                step_results["Final"] = "\n".join(lines)
+            elif show_probs:
+                step_results["Final"] = f"{itos[f_i[0]]} ({f_v[0]:.1%})"
+            else:
+                step_results["Final"] = itos[f_i[0]]
 
             results.append(step_results)
 
             # Update for next token
-            next_token = final_top_token
+            next_token = f_i[0]
             curr_idx = torch.cat(
                 [curr_idx, torch.tensor([[next_token]], device=self.device)], dim=1
             )
@@ -339,37 +387,52 @@ class TunedLens:
 
         # Display table
         console = Console()
-        table = Table(title=f"Tuned Lens Prediction Trajectory")
+        method_name = "Tuned Lens" if method == "tuned" else "Logit Lens"
+        table = Table(title=f"{method_name} Prediction Trajectory")
         table.caption = f"Equation: {equation}"
 
         table.add_column("Layer / Step", justify="left", style="bold cyan")
         for i in range(max_gen):
             table.add_column(f"Digit {i}", justify="center")
 
-        # Row for each layer
-        for l in range(self.n_layer):
-            row = [f"Layer {l}"]
+        # Row for each layer (including -1)
+        for l in range(self.n_layer + 1):
+            layer_label = f"Layer {l - 1}" if l > 0 else "Layer -1"
+            row = [layer_label]
             for i in range(max_gen):
-                row.append(results[i][f"Layer {l}"])
+                row.append(results[i][layer_label])
             table.add_row(*row)
 
-        # Row for Final Output
-        row_final = ["Final Output"]
-        for i in range(max_gen):
-            row_final.append(results[i]["Final"])
-        table.add_row(*row_final, style="bold green")
+        # # Row for Final Output
+        # row_final = ["Final Output"]
+        # for i in range(max_gen):
+        #     row_final.append(results[i]["Final"])
+        # table.add_row(*row_final, style="bold green")
 
         # Row for Correct Result
         try:
-            val1 = int(n1_str)
-            val2 = int(n2_str)
-            actual_sum_str = str(val1 + val2)[::-1]  # reversed
+            n1_digits = [int(c) for c in n1_str]
+            n2_digits = [int(c) for c in n2_str]
+            L1 = len(n1_digits)
+            L2 = len(n2_digits)
+            max_L = max(L1, L2)
+            s_digits_rev = []
+            carry = 0
+            for i in range(max_L):
+                d1 = n1_digits[L1 - 1 - i] if i < L1 else 0
+                d2 = n2_digits[L2 - 1 - i] if i < L2 else 0
+                total = d1 + d2 + carry
+                carry = total // 10
+                s_digits_rev.append(total)
+            s_digits_rev.append(carry)
+
             row_correct = ["Correct Result"]
             for i in range(max_gen):
-                digit = actual_sum_str[i] if i < len(actual_sum_str) else "0"
-                row_correct.append(digit)
+                token = s_digits_rev[i] if i < len(s_digits_rev) else 0
+                row_correct.append(itos[token])
             table.add_row(*row_correct, style="bold yellow")
-        except:
+        except Exception as e:
+            print(f"Error calculating correct result: {e}")
             pass
 
         if theoretical_no_carry:
@@ -409,6 +472,17 @@ def main():
         action="store_true",
         help="Force retraining even if save exists",
     )
+    parser.add_argument(
+        "--show_probs", action="store_true", help="Show probability of predictions"
+    )
+    parser.add_argument("--top_k", type=int, default=1, help="Show top K predictions")
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="tuned",
+        choices=["tuned", "logit"],
+        help="Lens method to use",
+    )
 
     args = parser.parse_args()
 
@@ -425,17 +499,32 @@ def main():
         force_train=args.force_train,
     )
 
-    # Load data for training translators
-    dm = AdditionDataModule(
-        min_train_digits=1, max_train_digits=7, batch_size=args.batch_size
-    )
-    dm.setup()
-    train_loader = dm.train_dataloader()
-
-    lens.train(train_loader, max_steps=args.max_steps, lr=args.lr)
+    if args.method == "tuned":
+        # Load data for training translators
+        dm = AdditionDataModule(
+            min_train_digits=1, max_train_digits=4, batch_size=args.batch_size
+        )
+        dm.setup()
+        train_loader = dm.train_dataloader()
+        lens.train(train_loader, max_steps=args.max_steps, lr=args.lr)
+        stoi, itos = dm.stoi, dm.itos
+    else:
+        # For logit lens we still need stoi/itos
+        # We can get them from the model if they are stored there, or just create a dummy DM
+        dm = AdditionDataModule()
+        dm.setup()
+        stoi, itos = dm.stoi, dm.itos
 
     # Visualize
-    lens.visualize_trajectory(args.equation, theoretical_no_carry=args.no_carry)
+    lens.visualize_trajectory(
+        args.equation,
+        stoi,
+        itos,
+        method=args.method,
+        theoretical_no_carry=args.no_carry,
+        show_probs=args.show_probs,
+        top_k=args.top_k,
+    )
 
 
 if __name__ == "__main__":

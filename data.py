@@ -80,7 +80,7 @@ class MultiOperandAdditionDataset(IterableDataset):
 
         for operand in operands_digits:
             carry = torch.zeros(B, dtype=torch.long)
-            for i in range(max_len-1, -1, -1):
+            for i in range(max_len - 1, -1, -1):
                 d_acc = current_sum[:, i]
                 d_op = operand[:, i]
 
@@ -171,6 +171,86 @@ class MultiOperandAdditionDataset(IterableDataset):
         return x, y, p1, p2, p3
 
 
+class SequentialMultiOperandAdditionDataset(IterableDataset):
+    """
+    Sequentially yields batches from multiple dataset configurations.
+    Used for validation to allow a single persistent worker pool.
+    """
+
+    def __init__(
+        self,
+        configurations,  # List of (digits, operands)
+        samples_per_config,
+        batch_size,
+        data_mode="variable",
+        offset_range=100,
+        random_offsets=True,
+    ):
+        super().__init__()
+        self.configurations = configurations
+        self.samples_per_config = samples_per_config
+        self.batch_size = batch_size
+        self.data_mode = data_mode
+        self.offset_range = offset_range
+        self.random_offsets = random_offsets
+
+        # Reuse the logic/vocab from the main dataset
+        # We can just instantiate a helper object or copy logic.
+        # Ideally, we refactor the generation logic out, but for now,
+        # we will instantiate a temporary helper to access properties/methods if needed,
+        # or just re-implement the loop calling a generator.
+
+        # Helper dataset to delegate generation to
+        # We will create one "template" dataset and update its params on the fly
+        self.template_ds = MultiOperandAdditionDataset(
+            min_digits=1,
+            max_digits=1,  # placeholders
+            batch_size=batch_size,
+            min_operands=2,
+            max_operands=2,  # placeholders
+            data_mode=data_mode,
+            offset_range=offset_range,
+            random_offsets=random_offsets,
+        )
+
+        self.vocab_size = self.template_ds.vocab_size
+        self.stoi = self.template_ds.stoi
+        self.itos = self.template_ds.itos
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+
+        # If multiple workers, we need to split the work?
+        # Actually validation usually doesn't need strict splitting effectively if we just want "some" samples.
+        # But for determinism and exact sample counts, we should be careful.
+        # Simpler: Each worker does the FULL sequence? No, that duplicates work.
+        # Each worker should do a subset.
+
+        total_samples = self.samples_per_config
+
+        if worker_info is not None:
+            # Simple split: divide samples_per_config by num_workers
+            per_worker = int(math.ceil(total_samples / worker_info.num_workers))
+            worker_id = worker_info.id
+            # TODO: Handle remainders correctly, but ceil is safe for validation (more is valid)
+        else:
+            per_worker = total_samples
+
+        for config_idx, (digits, operands) in enumerate(self.configurations):
+            # Update template dataset
+            self.template_ds.min_digits = digits
+            self.template_ds.max_digits = digits
+            self.template_ds.min_operands = operands
+            self.template_ds.max_operands = operands
+
+            # Yield batches
+            for _ in range(per_worker):
+                batch = self.template_ds.generate_batch()
+                # batch is (x, y, p1, p2, p3)
+                # Append config_idx
+                yield batch + (config_idx,)
+
+
 class AdditionDataModule(pl.LightningDataModule):
     def __init__(
         self,
@@ -256,8 +336,6 @@ class AdditionDataModule(pl.LightningDataModule):
         )
 
         # 2. Operands Grid
-        # We validate on a fixed set of operand counts to see generalization
-        # Including: In-distribution (max_train_ops) and OOD (up to max_val_ops)
         operands = sorted(
             list(
                 set(
@@ -273,31 +351,34 @@ class AdditionDataModule(pl.LightningDataModule):
             )
         )
 
-        dataloaders = []
-        self.val_names = []  # Reset and repopulate
-
-        # We create a specific selection of (L, N) pairs to avoid exponential explosion
-        # e.g., for each L, validate on max_train_ops and maybe max_val_ops
+        # Generate Configurations
+        self.val_config_names = []
+        configurations = []
 
         for L in lengths:
             for N in operands:
-                ds = MultiOperandAdditionDataset(
-                    L,
-                    L,
-                    self.val_bs,
-                    min_operands=N,
-                    max_operands=N,
-                    data_mode=self.hparams.data_mode,
-                    random_offsets=self.hparams.random_offsets,
-                )
-                dataloaders.append(
-                    DataLoader(
-                        ds,
-                        batch_size=None,
-                        num_workers=self.hparams.num_workers,
-                        persistent_workers=self.hparams.num_workers > 0,
-                    )
-                )
-                self.val_names.append(f"val_L{L}_N{N}")
+                configurations.append((L, N))
+                self.val_config_names.append(f"val_L{L}_N{N}")
 
-        return dataloaders
+        # Samples per config: We had limit_val_batches=50 in train.py?
+        # Or val_bs * limit_val_batches?
+        # Standard validation often runs for a fixed number of steps per loader.
+        # train.py uses limit_val_batches=50.
+        # Let's target 20 batches per config (arbitrary, user can tune).
+        batches_per_config = 20
+
+        # Single Sequential Dataset
+        val_ds = SequentialMultiOperandAdditionDataset(
+            configurations=configurations,
+            samples_per_config=batches_per_config,
+            batch_size=self.val_bs,
+            data_mode=self.hparams.data_mode,
+            random_offsets=self.hparams.random_offsets,
+        )
+
+        return DataLoader(
+            val_ds,
+            batch_size=None,
+            num_workers=self.hparams.num_workers,
+            persistent_workers=self.hparams.num_workers > 0,
+        )

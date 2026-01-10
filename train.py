@@ -32,19 +32,25 @@ class ValidationTableCallback(Callback):
         md_table += "|:---|---:|---:|---:|\n"
 
         # Get validation names from datamodule
-        val_names = getattr(trainer.datamodule, "val_names", [])
+        val_names = getattr(trainer.datamodule, "val_config_names", [])
         if not val_names:
-            return
+            # Fallback if names not found or using old logic
+            val_names = getattr(trainer.datamodule, "val_names", [])
+            if not val_names:
+                return
 
         metrics = trainer.callback_metrics
 
-        for i, name in enumerate(val_names):
-            suffix = f"/dataloader_idx_{i}"
+        for name in val_names:
+            # New format: val_acc_token/val_L1_N2
 
             def get_m(key_base):
-                val = metrics.get(f"{key_base}{suffix}")
-                if val is None and i == 0:
-                    val = metrics.get(key_base)
+                # Try specific name (Sequential logic)
+                val = metrics.get(f"{key_base}/{name}")
+                # Fallback to old dataloader_idx logic if name lookup fails (backward compact)
+                if val is None:
+                    # This fallback is tricky without index, but we assume new logic prevails
+                    pass
                 return val
 
             token_acc = get_m("val_acc_token")
@@ -329,7 +335,7 @@ def main():
     trainer_kwargs = {
         "max_steps": 5 if args.smoke_test else args.max_iters,
         "val_check_interval": 2 if args.smoke_test else args.eval_interval,
-        "limit_val_batches": 2 if args.smoke_test else 50,
+        "limit_val_batches": 2 if args.smoke_test else 1.0,
         "limit_train_batches": 2 if args.smoke_test else args.steps_per_epoch,
         "reload_dataloaders_every_n_epochs": 1,
         "callbacks": [

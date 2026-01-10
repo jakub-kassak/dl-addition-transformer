@@ -15,7 +15,15 @@ def load_model(ckpt_path, device):
     return model
 
 
-def inference(model, operands, offset_range=10):
+def encode(arr: list):
+    return " ".join(f"{i:<2}" for i in arr)
+
+
+def decode_tokens(tokens: list, itos: dict):
+    return list(itos[i] for i in tokens)
+
+
+def inference(model, operands):
     device = model.device
 
     # Prepare vocab
@@ -30,8 +38,11 @@ def inference(model, operands, offset_range=10):
 
     N = len(operands)
     max_digits = max(len(op) for op in operands)
-    carry_allowance = math.ceil(math.log10(model.hparams.get("max_operands", N)))
+    carry_allowance = math.ceil(math.log10(N))
     max_len = max_digits + carry_allowance
+    print(f"Max digits: {max_digits}")
+    print(f"Carry allowance: {carry_allowance}")
+    print(f"Max length: {max_len}")
 
     # 1. Construct Prompt Tokens
     # Format: N1 + N2 + ... + Nk =
@@ -40,7 +51,8 @@ def inference(model, operands, offset_range=10):
     p2_list = []
     p3_list = []
 
-    offset = random.randint(0, offset_range)
+    # offset = random.randint(0, offset_range)
+    offset = 0
 
     for k, op_str in enumerate(operands):
         # Pad op_str to max_len with zeros
@@ -49,96 +61,62 @@ def inference(model, operands, offset_range=10):
 
         L = len(op_tokens)
         tokens_list.extend(op_tokens)
-        p1_list.extend([k + 1] * L)
+        p1_list.extend([k + 1] * (L + 1))
         # PosID2: (L+1) down to 2
-        ids = list(range(L + 1, 1, -1))
-        p2_list.extend([i + offset for i in ids])
-        p3_list.extend([1] * L)
+        p2_list.extend(range(L, -1, -1))
+        p3_list.extend([1] * (L + 1))
 
         if k < N - 1:
             # Plus
             tokens_list.append(plus_token)
-            p1_list.append(k + 1)
-            p2_list.append(1 + offset)
-            p3_list.append(1)
         else:
             # Equals
             tokens_list.append(eq_token)
-            p1_list.append(k + 1)
-            p2_list.append(1 + offset)
-            p3_list.append(1)
 
+    print("Tokens: ", encode(decode_tokens(tokens_list, itos)))
+    print("P1:     ", encode(p1_list))
+    print("P2:     ", encode(p2_list))
+    print("P3:     ", encode(p3_list))
     x = torch.tensor(tokens_list).unsqueeze(0).to(device)
     pos1 = torch.tensor(p1_list).unsqueeze(0).to(device)
     pos2 = torch.tensor(p2_list).unsqueeze(0).to(device)
     pos3 = torch.tensor(p3_list).unsqueeze(0).to(device)
 
-    # 2. Generation Loop
-    # We generate until #
-    generated_tokens = []
+    # 2. Generation Loop using model.generate
+    # We generate until # or max_gen
 
-    # State tracking for positional IDs during generation
-    curr_block = 0  # S0 starts block 1
-    curr_p2 = 1
-
-    max_gen = (max_len + 1) * (N + 1) + 10  # Safety limit
+    special_tokens = {
+        ">": greater_token,
+        "+": plus_token,
+        "=": eq_token,
+        "#": hash_token,
+    }
 
     print(f"\nTask: {' + '.join(operands)}")
     print(f"Padded Max Length: {max_len}")
 
-    for _ in range(max_gen):
-        with torch.no_grad():
-            # Support both old (2-pos) and new (3-pos) forward calls if needed,
-            # but we assume the new version.
-            logits, _ = model(x, pos1, pos2, pos3_ids=pos3)
+    # Run generation
+    # model.generate returns (idx, pos1, pos2, pos3)
+    # x input shape is (1, T)
+    prompt_len = x.shape[1]
 
-        # Predict next token
-        last_logits = logits[0, -1, :]
-        probs = F.softmax(last_logits, dim=0)
-        _, next_token_id = torch.max(probs, dim=0)
+    # Safety limit for generation
+    max_gen = (max_len + 1) * (N + 1) + 10
 
-        next_id = next_token_id.item()
-        next_char = itos[next_id]
-        generated_tokens.append(next_char)
+    x, pos1, pos2, pos3 = model.generate(
+        x,
+        pos1,
+        pos2,
+        pos3,
+        max_new_tokens=max_gen,
+        special_tokens=special_tokens,
+        offset=offset,
+    )
 
-        if next_id == hash_token:
-            break
-
-        # Update inputs for next step
-        x = torch.cat([x, next_token_id.view(1, 1)], dim=1)
-
-        # update positional ids for next step
-        # Logic:
-        # If we just generated next_id, what are ITS pos IDs?
-        # Actually x we just updated ALREADY includes next_id.
-        # But for the NEXT iteration, we need the PosIDs of the token at x[0, -1].
-
-        # Wait, the `model` call uses current x, pos1, pos2, pos3.
-        # So we need to append the PosIDs for the token we just added to x.
-
-        if next_id == greater_token or next_id == plus_token:
-            # Separator > or +
-            pos1 = torch.cat(
-                [pos1, torch.tensor([[curr_block + 1]], device=device)], dim=1
-            )
-            pos2 = torch.cat(
-                [pos2, torch.tensor([[max_len + 1 + offset]], device=device)], dim=1
-            )
-            pos3 = torch.cat([pos3, torch.tensor([[2]], device=device)], dim=1)
-
-            # Prepare for next partial sum block
-            curr_block += 1
-            curr_p2 = 1
-        else:
-            # Digit in Scratchpad or Result
-            pos1 = torch.cat(
-                [pos1, torch.tensor([[curr_block + 1]], device=device)], dim=1
-            )
-            pos2 = torch.cat(
-                [pos2, torch.tensor([[curr_p2 + offset]], device=device)], dim=1
-            )
-            pos3 = torch.cat([pos3, torch.tensor([[2]], device=device)], dim=1)
-            curr_p2 += 1
+    # Extract generated portion
+    # x is (1, T_total)
+    generated_ids = x[0, prompt_len:].tolist()
+    generated_tokens = [itos[i] for i in generated_ids]
 
     full_gen_str = "".join(generated_tokens)
     print(f"Generated Scratchpad: {full_gen_str}")
@@ -150,10 +128,16 @@ def inference(model, operands, offset_range=10):
     print("-" * len(header))
 
     # Combine everything for display
-    all_tokens = tokens_list + [stoi[t] for t in generated_tokens]
-    p1_all = pos1.squeeze().tolist()
-    p2_all = pos2.squeeze().tolist()
-    p3_all = pos3.squeeze().tolist()
+    # x contains full sequence IDs
+    all_tokens = x[0].tolist()
+
+    # pos tensors contain full sequence positions
+    p_len = pos1.shape[1]
+    # Ensure lengths match (generate ensures this)
+
+    p1_all = pos1[0].tolist()
+    p2_all = pos2[0].tolist()
+    p3_all = pos3[0].tolist()
 
     for i in range(len(all_tokens)):
         t_id = all_tokens[i]

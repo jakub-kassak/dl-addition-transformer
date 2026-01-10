@@ -365,17 +365,34 @@ class GPTLightningModule(pl.LightningModule):
         self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=True)
         return loss
 
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        idx, targets, pos1_ids, pos2_ids, pos3_ids = batch
+    def validation_step(self, batch, batch_idx):
+        if len(batch) == 6:
+            idx, targets, pos1_ids, pos2_ids, pos3_ids, config_idx = batch
+        else:
+            # Fallback for sanity checks or old datasets
+            idx, targets, pos1_ids, pos2_ids, pos3_ids = batch
+            config_idx = None
+
         logits, loss = self(idx, pos1_ids, pos2_ids, pos3_ids, targets)
 
+        # Determine metric suffix
+        suffix = ""
+        if config_idx is not None and hasattr(
+            self.trainer.datamodule, "val_config_names"
+        ):
+            # Assuming purely sequential batches from one config, config_idx should be identical in batch
+            # We take the first one.
+            c_id = config_idx
+            name = self.trainer.datamodule.val_config_names[c_id]
+            suffix = f"/{name}"
+
+        # Log Loss
         self.log(
-            "val_loss",
+            f"val_loss{suffix}",
             loss,
             on_step=False,
             on_epoch=True,
             prog_bar=False,
-            add_dataloader_idx=True,
         )
 
         # Accuracy Calculation
@@ -400,40 +417,44 @@ class GPTLightningModule(pl.LightningModule):
             correct & valid_acc_mask
         ).sum().float() / valid_acc_mask.sum().float()
         self.log(
-            "val_acc_token",
+            f"val_acc_token{suffix}",
             token_acc,
             on_step=False,
             on_epoch=True,
             prog_bar=False,
-            add_dataloader_idx=True,
         )
 
         # 2. Sequence-wise Accuracy
         row_correct = (correct | (~valid_acc_mask)).all(dim=1)
         seq_acc = row_correct.float().mean()
         self.log(
-            "val_acc_seq",
+            f"val_acc_seq{suffix}",
             seq_acc,
             on_step=False,
             on_epoch=True,
             prog_bar=False,
-            add_dataloader_idx=True,
         )
 
         return loss
 
     def on_validation_epoch_end(self):
+        # We need to manually aggregate because we are logging dynamic keys
+        # Actually, PL handles aggregation of "val_loss/val_L1_N2" automatically across the epoch if identifiers match.
+        # We want to compute an overall "val_avg_seq_acc" for checkpointing.
+
         metrics = self.trainer.callback_metrics
-        seq_accs = [v for k, v in metrics.items() if "val_acc_seq/dataloader_idx_" in k]
-        losses = [v for k, v in metrics.items() if "val_loss/dataloader_idx_" in k]
+        # Look for any key starting with val_acc_seq/val_
+        seq_accs = [v for k, v in metrics.items() if "val_acc_seq/val_" in k]
+        losses = [v for k, v in metrics.items() if "val_loss/val_" in k]
 
         if seq_accs:
             avg_seq_acc = torch.stack(seq_accs).mean()
             self.log("val_avg_seq_acc", avg_seq_acc, prog_bar=True)
-
-        if losses:
-            avg_loss = torch.stack(losses).mean()
-            self.log("val_avg_loss", avg_loss, prog_bar=False)
+            self.log(
+                "val_avg_loss",
+                torch.stack(losses).mean() if losses else 0.0,
+                prog_bar=False,
+            )
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
@@ -454,36 +475,80 @@ class GPTLightningModule(pl.LightningModule):
         }
 
     @torch.no_grad()
-    def generate(self, idx, pos1_ids, pos2_ids, pos3_ids, max_new_tokens):
-        # Assumes single batch sample for simplicity or vectorized
+    def generate(
+        self,
+        idx,
+        pos1_ids,
+        pos2_ids,
+        pos3_ids,
+        max_new_tokens,
+        special_tokens=None,
+        offset=0,
+    ):
+        """
+        Autoregressively generate tokens with correct 2D-Positional Update logic.
+        special_tokens: dict with keys '>', '+', '=', '#' mapping to IDs.
+        """
+        assert special_tokens is not None, "Must provide special_tokens dict"
+        greater_token = special_tokens[">"]
+        hash_token = special_tokens["#"]
+        eq_token = self.hparams.eq_token
+
         for _ in range(max_new_tokens):
+            # 1. Forward pass
             logits, _ = self(idx, pos1_ids, pos2_ids, pos3_ids)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
+            last_logits = logits[:, -1, :]
+            probs = F.softmax(last_logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # 2. Determine Next Positions based on WHAT WE JUST GENERATED (idx_next)
+            # and the context of the LAST token we were at.
+            
+            last_token = idx[:, -1]
+            last_p1 = pos1_ids[:, -1]
+            last_p2 = pos2_ids[:, -1]
+            last_p3 = pos3_ids[:, -1]
+            
+            # We construct masks for conditions
+            is_eq = (last_token == eq_token)
+            is_greater = (last_token == greater_token)
+            
+            # Base values (for digit continuation)
+            new_p1 = last_p1.clone()
+            new_p2 = last_p2 + 1
+            new_p3 = torch.full_like(last_p3, 2) # Scratchpad is always 2 (or Result)
+            
+            # Case: Eq (End of Input -> Start S0)
+            # p1 becomes 1
+            new_p1 = torch.where(is_eq, torch.tensor(1, device=idx.device), new_p1)
+            # p2 becomes 1 + offset
+            new_p2 = torch.where(is_eq, torch.tensor(1 + offset, device=idx.device), new_p2)
+            
+            # Case: Greater (Separator -> Start Next Block)
+            # p1 increments
+            new_p1 = torch.where(is_greater, last_p1 + 1, new_p1)
+            # p2 resets to 1 + offset
+            new_p2 = torch.where(is_greater, torch.tensor(1 + offset, device=idx.device), new_p2)
 
-            # Logic to update pos1, pos2, pos3 for next token?
-            # This is non-trivial for general scratchpad.
-            # We need to know context.
-            # For specific addition task, we could hardcode update rules:
-            # If in Result (pos3=3), pos2 decreases, pos1 stays same.
-            # If in Scratchpad (pos3=2), pos2 increases, etc.
-
-            # Simple heuristic for now:
-            # Repeat last dim pattern? No.
-            # For now, let's just append copies of last pos just to make it run (incorrect generation logic but valid shape)
-            # OR better: prompt user or separate agent for inference update logic.
-            # The prompt "extract and parametrize as much functionality..." implies training focus.
-            # I will implement basic "continue pattern" logic if possible, or leave placeholder.
-
-            # Placeholder: just clone last pos (will result in garbage if used for long gen)
-            next_pos1 = pos1_ids[:, -1:]
-            next_pos2 = pos2_ids[:, -1:]  # Should update?
-            next_pos3 = pos3_ids[:, -1:]
+            # Case: Hash (End Token)
+            is_hash_next = (idx_next.squeeze(-1) == hash_token)
+            if is_hash_next.any():
+                # Overwrite for hash
+                # p2 becomes 0
+                new_p2 = torch.where(is_hash_next, torch.tensor(0, device=idx.device), new_p2)
+                # p1, p3 stay as computed (p1=last_p1, p3=2)
+            
+            # Reshape for concatenation
+            new_p1 = new_p1.unsqueeze(1)
+            new_p2 = new_p2.unsqueeze(1)
+            new_p3 = new_p3.unsqueeze(1)
 
             idx = torch.cat((idx, idx_next), dim=1)
-            pos1_ids = torch.cat((pos1_ids, next_pos1), dim=1)
-            pos2_ids = torch.cat((pos2_ids, next_pos2), dim=1)
-            pos3_ids = torch.cat((pos3_ids, next_pos3), dim=1)
+            pos1_ids = torch.cat((pos1_ids, new_p1), dim=1)
+            pos2_ids = torch.cat((pos2_ids, new_p2), dim=1)
+            pos3_ids = torch.cat((pos3_ids, new_p3), dim=1)
+            
+            if is_hash_next.all():
+                break
 
-        return idx
+        return idx, pos1_ids, pos2_ids, pos3_ids

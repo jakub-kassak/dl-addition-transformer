@@ -38,9 +38,6 @@ def main():
     # Need to call val_dataloader to populate val_names
     _ = dm.val_dataloader()
 
-    print(f"\nValidation Sets ({len(dm.val_names)} total):")
-    print(", ".join(dm.val_names))
-
     loader = dm.train_dataloader()
     try:
         batch = next(iter(loader))

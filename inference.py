@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import argparse
 import random
+import math
 from model import GPTLightningModule
 
 
@@ -14,113 +15,195 @@ def load_model(ckpt_path, device):
     return model
 
 
-def inference(model, n1_str, n2_str, offset_range=10):
+def inference(model, operands, offset_range=10):
     device = model.device
 
     # Prepare vocab
-    chars = [str(i) for i in range(20)] + ["+", "="]
+    chars = [str(i) for i in range(20)] + ["+", "=", ">", "#"]
     stoi = {ch: i for i, ch in enumerate(chars)}
     itos = {i: ch for i, ch in enumerate(chars)}
 
-    # Training assumes max(len(n1), len(n2)) roughly.
-    L = max(len(n1_str), len(n2_str))
+    plus_token = stoi["+"]
+    eq_token = stoi["="]
+    greater_token = stoi[">"]
+    hash_token = stoi["#"]
 
-    # Construct Tokens
-    # Format: n1... + n2... =
-    n1_str = f"{n1_str:0>{L}}"
-    n2_str = f"{n2_str:0>{L}}"
-    prompt_str = f"{n1_str}+{n2_str}="
-    tokens = [stoi[c] for c in prompt_str]
-    x = torch.tensor(tokens).unsqueeze(0).to(device)  # (1, T)
+    N = len(operands)
+    max_digits = max(len(op) for op in operands)
+    carry_allowance = math.ceil(math.log10(model.hparams.get("max_operands", N)))
+    max_len = max_digits + carry_allowance
 
-    # Construct Pos1 (Roles)
-    # n1 digits -> 1
-    # + -> 1
-    # n2 digits -> 2
-    # = -> 2
-    p1_n1 = [1] * len(n1_str)
-    p1_plus = [1]
-    p1_n2 = [2] * len(n2_str)
-    p1_eq = [2]
-    p1_seq = p1_n1 + p1_plus + p1_n2 + p1_eq
-    pos1 = torch.tensor(p1_seq).unsqueeze(0).to(device)
+    # 1. Construct Prompt Tokens
+    # Format: N1 + N2 + ... + Nk =
+    tokens_list = []
+    p1_list = []
+    p2_list = []
+    p3_list = []
 
-    # Construct Pos2 (Significance/Column) with Random Offset
-    # n1: 1..len(n1)
-    # +: 1
-    # n2: 1..len(n2)
-    # =: 1
     offset = random.randint(0, offset_range)
 
-    p2_n1 = [i + 1 + offset for i in range(len(n1_str))][
-        ::-1
-    ]  # 1 to L -> Reversed to L to 1
-    p2_plus = [0 + offset]
-    p2_n2 = [i + 1 + offset for i in range(len(n2_str))][
-        ::-1
-    ]  # 1 to L -> Reversed to L to 1
-    p2_eq = [0 + offset]
-    p2_seq = p2_n1 + p2_plus + p2_n2 + p2_eq
-    pos2 = torch.tensor(p2_seq).unsqueeze(0).to(device)
+    for k, op_str in enumerate(operands):
+        # Pad op_str to max_len with zeros
+        padded_op = op_str.zfill(max_len)
+        op_tokens = [stoi[c] for c in padded_op]
 
-    # Generation Loop
-    # We generate L+1 digits (including carry)
-    # pos2 for result goes: L + offset, L-1 + offset, ..., 0 + offset
+        L = len(op_tokens)
+        tokens_list.extend(op_tokens)
+        p1_list.extend([k + 1] * L)
+        # PosID2: (L+1) down to 2
+        ids = list(range(L + 1, 1, -1))
+        p2_list.extend([i + offset for i in ids])
+        p3_list.extend([1] * L)
 
-    result_digits = []
+        if k < N - 1:
+            # Plus
+            tokens_list.append(plus_token)
+            p1_list.append(k + 1)
+            p2_list.append(1 + offset)
+            p3_list.append(1)
+        else:
+            # Equals
+            tokens_list.append(eq_token)
+            p1_list.append(k + 1)
+            p2_list.append(1 + offset)
+            p3_list.append(1)
 
-    print(f"\nTask: {n1_str} + {n2_str}")
-    print(f"Length: {L}")
-    print(f"Input Tokens: {prompt_str}")
-    print(f"Position 1:   {pos1}")
-    print(f"Position 2:   {pos2}")
+    x = torch.tensor(tokens_list).unsqueeze(0).to(device)
+    pos1 = torch.tensor(p1_list).unsqueeze(0).to(device)
+    pos2 = torch.tensor(p2_list).unsqueeze(0).to(device)
+    pos3 = torch.tensor(p3_list).unsqueeze(0).to(device)
 
-    # Next Pos2 values for generation
-    # From L down to 0
-    # Next Pos2 values for generation
-    # From 1 up to L+1 (LSB .. MSB)
-    next_pos2_vals = [i + offset for i in range(1, L + 2)]
+    # 2. Generation Loop
+    # We generate until #
+    generated_tokens = []
 
-    for step, next_p2 in enumerate(next_pos2_vals):
-        # Get logits
+    # State tracking for positional IDs during generation
+    curr_block = 0  # S0 starts block 1
+    curr_p2 = 1
+
+    max_gen = (max_len + 1) * (N + 1) + 10  # Safety limit
+
+    print(f"\nTask: {' + '.join(operands)}")
+    print(f"Padded Max Length: {max_len}")
+
+    for _ in range(max_gen):
         with torch.no_grad():
-            logits, _ = model(x, pos1, pos2)
+            # Support both old (2-pos) and new (3-pos) forward calls if needed,
+            # but we assume the new version.
+            logits, _ = model(x, pos1, pos2, pos3_ids=pos3)
 
-        # Predict next token from last position
+        # Predict next token
         last_logits = logits[0, -1, :]
         probs = F.softmax(last_logits, dim=0)
         _, next_token_id = torch.max(probs, dim=0)
 
-        # Decode
-        next_token = itos[next_token_id.item()]
+        next_id = next_token_id.item()
+        next_char = itos[next_id]
+        generated_tokens.append(next_char)
 
-        # Store
-        result_digits.append(next_token)
+        if next_id == hash_token:
+            break
 
         # Update inputs for next step
-        # x -> append next_token_id
         x = torch.cat([x, next_token_id.view(1, 1)], dim=1)
 
-        # pos1 -> append 3 (Sum role)
-        pos1 = torch.cat([pos1, torch.tensor([[3]], device=device)], dim=1)
+        # update positional ids for next step
+        # Logic:
+        # If we just generated next_id, what are ITS pos IDs?
+        # Actually x we just updated ALREADY includes next_id.
+        # But for the NEXT iteration, we need the PosIDs of the token at x[0, -1].
 
-        # pos2 -> append next_p2 (which corresponds to the digit we just generated)
-        # Wait, the p2 we append is for the token we just added.
-        # That token is `sum[current]`.
-        # Its p2 is `next_p2`.
-        pos2 = torch.cat([pos2, torch.tensor([[next_p2]], device=device)], dim=1)
+        # Wait, the `model` call uses current x, pos1, pos2, pos3.
+        # So we need to append the PosIDs for the token we just added to x.
 
-    print(f"Result (Reversed): {''.join(result_digits)}")
+        if next_id == greater_token or next_id == plus_token:
+            # Separator > or +
+            pos1 = torch.cat(
+                [pos1, torch.tensor([[curr_block + 1]], device=device)], dim=1
+            )
+            pos2 = torch.cat(
+                [pos2, torch.tensor([[max_len + 1 + offset]], device=device)], dim=1
+            )
+            pos3 = torch.cat([pos3, torch.tensor([[2]], device=device)], dim=1)
 
-    # Reverse back to normal number
-    # result_digits contains raw tokens as strings (from itos)
-    # Convert them to int % 10 then back to string for joining
-    final_res_str = "".join([str(int(d) % 10) for d in result_digits])
-    final_res = int(final_res_str[::-1])
-    correct_res = int(n1_str) + int(n2_str)
-    print(f"Final Answer:   {final_res}")
-    print(f"Correct Answer: {correct_res}")
-    if final_res == correct_res:
+            # Prepare for next partial sum block
+            curr_block += 1
+            curr_p2 = 1
+        else:
+            # Digit in Scratchpad or Result
+            pos1 = torch.cat(
+                [pos1, torch.tensor([[curr_block + 1]], device=device)], dim=1
+            )
+            pos2 = torch.cat(
+                [pos2, torch.tensor([[curr_p2 + offset]], device=device)], dim=1
+            )
+            pos3 = torch.cat([pos3, torch.tensor([[2]], device=device)], dim=1)
+            curr_p2 += 1
+
+    full_gen_str = "".join(generated_tokens)
+    print(f"Generated Scratchpad: {full_gen_str}")
+
+    # 3. Final Visualization
+    print("\nToken-Position Alignment:")
+    header = f"{'Token':<8} | {'P1':<4} | {'P2':<4} | {'P3':<4} | Segment"
+    print(header)
+    print("-" * len(header))
+
+    # Combine everything for display
+    all_tokens = tokens_list + [stoi[t] for t in generated_tokens]
+    p1_all = pos1.squeeze().tolist()
+    p2_all = pos2.squeeze().tolist()
+    p3_all = pos3.squeeze().tolist()
+
+    for i in range(len(all_tokens)):
+        t_id = all_tokens[i]
+        char = itos[t_id]
+        p1 = p1_all[i]
+        p2 = p2_all[i]
+        p3 = p3_all[i]
+
+        seg = "Input" if p3 == 1 else "Scratch" if p3 == 2 else "Result"
+        print(f"{char:<8} | {p1:<4} | {p2:<4} | {p3:<4} | {seg}")
+
+    # 4. Decode Result
+    # Result is the LAST partial sum Sn (before #)
+    sum_segments = []
+    current_seg = []
+    separators = ["+", "=", ">", "#"]
+
+    for t in generated_tokens:
+        if t in separators:
+            if current_seg:
+                sum_segments.append(current_seg)
+            current_seg = []
+        else:
+            # Digit token (0-19)
+            try:
+                val = int(t) % 10
+                current_seg.append(val)
+            except ValueError:
+                # Handle cases where t might be something else unexpectedly
+                continue
+
+    if current_seg:
+        sum_segments.append(current_seg)
+
+    if not sum_segments:
+        print("❌ No sum segments found in scratchpad.")
+        return
+
+    final_digits_lsb = sum_segments[-1]
+    # Convert LSB to number
+    final_val = 0
+    for i, d in enumerate(final_digits_lsb):
+        final_val += d * (10**i)
+
+    correct_val = sum(int(op) for op in operands)
+
+    print(f"Final Decoded Sum: {final_val}")
+    print(f"Correct Sum:      {correct_val}")
+
+    if final_val == correct_val:
         print("✅ Correct!")
     else:
         print("❌ Incorrect.")
@@ -129,8 +212,12 @@ def inference(model, n1_str, n2_str, offset_range=10):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", type=str, required=True)
-    parser.add_argument("--n1", type=str, default="123")
-    parser.add_argument("--n2", type=str, default="456")
+    parser.add_argument(
+        "--operands",
+        type=str,
+        default="123,456",
+        help="Comma-separated list of operands",
+    )
     args = parser.parse_args()
 
     # Device handling
@@ -138,7 +225,9 @@ def main():
     print(f"Using device: {device}")
 
     model = load_model(args.ckpt_path, device)
-    inference(model, args.n1, args.n2)
+
+    operands = args.operands.split(",")
+    inference(model, operands)
 
 
 if __name__ == "__main__":

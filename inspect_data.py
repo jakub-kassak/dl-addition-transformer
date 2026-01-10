@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--val_operand_step", type=int, default=2)
     parser.add_argument("--val_step", type=int, default=3)
     parser.add_argument("--data_mode", type=str, default="variable")
+    parser.add_argument("--random_offsets", type=bool, default=False)
     args = parser.parse_args()
 
     print(
@@ -30,7 +31,7 @@ def main():
         min_operands=args.min_operands,
         max_operands=args.max_operands,
         data_mode=args.data_mode,
-        random_offsets=True,  # Explicitly enable for inspection
+        random_offsets=args.random_offsets,  # Explicitly enable for inspection
     )
     dm.setup()
 
@@ -53,7 +54,7 @@ def main():
     itos = dm.itos
 
     def decode(indices):
-        return "".join([itos[i.item()] for i in indices])
+        return   " ".join([f'{itos[i.item()]:>2}' for i in indices])
 
     print(f"\nBatch Shapes:")
     print(f"x: {x.shape}")
@@ -73,8 +74,11 @@ def main():
         # Just show raw y
         seq_y = decode(y[i])
 
-        print(f"x (Input):  {seq_x}")
-        print(f"y (Target): {seq_y}")
+        print(f"y (Target):  {seq_y}")
+        print(f"x  (Input):  {seq_x}")
+        print(f"p1 (Block):  {" ".join(f'{p:>2}' for p in p1[i].tolist())}")
+        print(f"p2 (Digit):  {" ".join(f'{p:>2}' for p in p2[i].tolist())}")
+        print(f"p3  (Type):  {" ".join(f'{p:>2}' for p in p3[i].tolist())}")
 
         # Positional Encodings
         tokens_x = [itos[idx.item()] for idx in x[i]]
@@ -82,16 +86,17 @@ def main():
         pos2_vals = p2[i].tolist()
         pos3_vals = p3[i].tolist()
 
-        print("-" * 80)
-        print(
-            f"{'Token':<6} | {'Pos1 (Block)':<12} | {'Pos2 (Digit+Offset)':<20} | {'Pos3 (Type)':<12}"
-        )
-        print("-" * 80)
+        if False:
+            print("-" * 80)
+            print(
+                f"{'Token':<6} | {'Pos1 (Block)':<12} | {'Pos2 (Digit+Offset)':<20} | {'Pos3 (Type)':<12}"
+            )
+            print("-" * 80)
 
-        for t, p1_v, p2_v, p3_v in zip(tokens_x, pos1_vals, pos2_vals, pos3_vals):
-            # map p3 to description
-            type_desc = "Input" if p3_v == 1 else "Scratch" if p3_v == 2 else "Result"
-            print(f"{t:<6} | {p1_v:<12} | {p2_v:<20} | {p3_v:<4} ({type_desc})")
+            for t, p1_v, p2_v, p3_v in zip(tokens_x, pos1_vals, pos2_vals, pos3_vals):
+                # map p3 to description
+                type_desc = "Input" if p3_v == 1 else "Scratch" if p3_v == 2 else "Result"
+                print(f"{t:<6} | {p1_v:<12} | {p2_v:<20} | {p3_v:<4} ({type_desc})")
 
     print("\n✅ Inspection Complete")
 

@@ -75,43 +75,21 @@ class MultiOperandAdditionDataset(IterableDataset):
         # 3. Compute Partial Sums (S0=0, S1=N1, ..., SN=Sum(N1..NN))
         # Each Si is stored LSB-first in scratchpad_segments (length max_len)
         scratchpad_segments = []
-        current_sum = torch.zeros(
-            (B, max_len), dtype=torch.long
-        )  # LSB-first internally?
-        # Actually let's just use decimal addition directly.
+        current_sum = torch.zeros((B, max_len), dtype=torch.long)
+        scratchpad_segments.append(current_sum.clone())
 
-        # S0 = zeros
-        scratchpad_segments.append(torch.zeros((B, max_len), dtype=torch.long))
-
-        last_sum_val = torch.zeros(B, dtype=torch.long)
-        for k in range(N):
-            # Convert operand k from MSB-first to LSB-first digits
-            op_lsb = operands_digits[k].flip(1)
-
-            new_sum_tokens = []
+        for operand in operands_digits:
             carry = torch.zeros(B, dtype=torch.long)
-
-            # Current sum being built (S_{k+1})
-            # To generate S_{k+1}, we add S_k + N_{k+1}
-            # Wait, the code should add the result of previous step (already in current_sum as new_d).
-            # We used current_sum as the accumulator.
-
-            for i in range(max_len):
+            for i in range(max_len-1, -1, -1):
                 d_acc = current_sum[:, i]
-                d_op = op_lsb[:, i]
+                d_op = operand[:, i]
 
                 total = d_acc + d_op + carry
-                new_d = total % 10
-                new_c = total // 10
+                carry = total // 10
+                current_sum[:, i] = total
 
-                # Token includes incoming carry marker (10-19)
-                token = new_d + (carry > 0).long() * 10
-                new_sum_tokens.append(token)
-
-                current_sum[:, i] = new_d
-                carry = new_c
-
-            scratchpad_segments.append(torch.stack(new_sum_tokens, dim=1))
+            scratchpad_segments.append(current_sum.flip(1))
+            current_sum %= 10
 
         # 4. Construct Full Sequence
         # Input: N1 + N2 + ... + Nk =
@@ -132,7 +110,7 @@ class MultiOperandAdditionDataset(IterableDataset):
             # PosID1: MSB first uses decreasing IDs. Separator gets 1.
             # Figure 4 shows 4 3 2 1 for 3-digit number + sep.
             # So IDs are (L+1) down to 2, then 1 for separator.
-            ids = torch.arange(L + 1, 1, -1).unsqueeze(0).expand(B, -1)
+            ids = torch.arange(L, 0, -1).unsqueeze(0).expand(B, -1)
             p2_list.append(ids)
             p3_list.append(torch.full((B, L), 1, dtype=torch.long))
 
@@ -140,13 +118,13 @@ class MultiOperandAdditionDataset(IterableDataset):
                 # Separator [+]
                 tokens_list.append(plus)
                 p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
-                p2_list.append(torch.ones((B, 1), dtype=torch.long))
+                p2_list.append(torch.zeros((B, 1), dtype=torch.long))
                 p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
             else:
                 # Separator [=]
                 tokens_list.append(eq)
                 p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
-                p2_list.append(torch.ones((B, 1), dtype=torch.long))
+                p2_list.append(torch.zeros((B, 1), dtype=torch.long))
                 p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
 
         # -- Scratchpad Phase --

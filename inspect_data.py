@@ -9,26 +9,45 @@ def main():
     parser.add_argument("--max_digits", type=int, default=7)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--n_samples", type=int, default=3)
+    parser.add_argument("--min_operands", type=int, default=2)
+    parser.add_argument("--max_operands", type=int, default=3)
+    parser.add_argument("--max_val_operands", type=int, default=5)
+    parser.add_argument("--val_operand_step", type=int, default=2)
+    parser.add_argument("--val_step", type=int, default=3)
+    parser.add_argument("--data_mode", type=str, default="variable")
     args = parser.parse_args()
 
-    print(f"--- Data Inspection (L={args.min_digits}-{args.max_digits}) ---")
+    print(
+        f"--- Data Inspection (L={args.min_digits}-{args.max_digits}, N={args.min_operands}-{args.max_operands}, mode={args.data_mode}) ---"
+    )
 
     # Initialize DataModule
     dm = AdditionDataModule(
         min_train_digits=args.min_digits,
         max_train_digits=args.max_digits,
         batch_size=args.batch_size,
-        curriculum_start=args.max_digits,  # Force max digits immediately for inspection
+        curriculum_start=args.max_digits,
+        min_operands=args.min_operands,
+        max_operands=args.max_operands,
+        data_mode=args.data_mode,
+        random_offsets=True,  # Explicitly enable for inspection
     )
     dm.setup()
 
-    # We need to manually set the max_digits if we want to test a specific range
-    # effectively bypassing the curriculum start if needed, but here we set curriculum_start = max_digits
+    # Need to call val_dataloader to populate val_names
+    _ = dm.val_dataloader()
+
+    print(f"\nValidation Sets ({len(dm.val_names)} total):")
+    print(", ".join(dm.val_names))
 
     loader = dm.train_dataloader()
-    batch = next(iter(loader))
+    try:
+        batch = next(iter(loader))
+    except StopIteration:
+        print("No data in loader!")
+        return
 
-    x, y, p1, p2 = batch
+    x, y, p1, p2, p3 = batch
 
     # Vocabulary for decoding
     itos = dm.itos
@@ -41,30 +60,38 @@ def main():
     print(f"y: {y.shape}")
     print(f"p1: {p1.shape}")
     print(f"p2: {p2.shape}")
+    print(f"p3: {p3.shape}")
 
     for i in range(min(args.n_samples, x.shape[0])):
         print(f"\nSample {i}:")
 
         # Decode Equation
         seq_x = decode(x[i])
+
+        # Helper to show targets (mask padding)
+        # We don't have mask here easily unless we replicate logic.
+        # Just show raw y
         seq_y = decode(y[i])
 
         print(f"x (Input):  {seq_x}")
         print(f"y (Target): {seq_y}")
 
         # Positional Encodings
-        # We'll align them with x for visualization
         tokens_x = [itos[idx.item()] for idx in x[i]]
         pos1_vals = p1[i].tolist()
         pos2_vals = p2[i].tolist()
+        pos3_vals = p3[i].tolist()
 
-        print("-" * 60)
-        print(f"{'Token':<6} | {'Pos1 (Role)':<12} | {'Pos2 (Digit+Offset)':<20}")
-        print("-" * 60)
+        print("-" * 80)
+        print(
+            f"{'Token':<6} | {'Pos1 (Block)':<12} | {'Pos2 (Digit+Offset)':<20} | {'Pos3 (Type)':<12}"
+        )
+        print("-" * 80)
 
-        for t, p1_v, p2_v in zip(tokens_x, pos1_vals, pos2_vals):
-            role = "N1" if p1_v == 1 else "N2" if p1_v == 2 else "Sum"
-            print(f"{t:<6} | {p1_v:<4} ({role:<5}) | {p2_v:<20}")
+        for t, p1_v, p2_v, p3_v in zip(tokens_x, pos1_vals, pos2_vals, pos3_vals):
+            # map p3 to description
+            type_desc = "Input" if p3_v == 1 else "Scratch" if p3_v == 2 else "Result"
+            print(f"{t:<6} | {p1_v:<12} | {p2_v:<20} | {p3_v:<4} ({type_desc})")
 
     print("\n✅ Inspection Complete")
 

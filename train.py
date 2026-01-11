@@ -1,5 +1,5 @@
 """
-2D Positional Addition Transformer Training Script.
+Absolute Positional Encoding Addition Transformer Training Script.
 Features experiment isolation, validation-only mode, and length generalization tracking.
 """
 
@@ -7,15 +7,15 @@ from math import ceil
 import os
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
 from pytorch_lightning.loggers import TensorBoardLogger
 import argparse
 from rich.console import Console
 from rich.table import Table
+from tqdm import tqdm
 
 from model import GPTLightningModule
-from data import AdditionDataModule
+from data_1dPE import AdditionDataModule
 
 
 class ValidationTableCallback(Callback):
@@ -81,6 +81,55 @@ class ValidationTableCallback(Callback):
         console.print(table)
 
 
+class ProgressBarCallback(Callback):
+    """Add tqdm progress bar for training and validation"""
+    
+    def on_train_start(self, trainer, pl_module):
+        self.train_pbar = None
+        
+    def on_train_epoch_start(self, trainer, pl_module):
+        if self.train_pbar is not None:
+            self.train_pbar.close()
+        total_batches = trainer.num_training_batches
+        self.train_pbar = tqdm(
+            total=total_batches,
+            desc=f"Epoch {trainer.current_epoch}",
+            unit="batch",
+            leave=True
+        )
+    
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self.train_pbar is not None:
+            # Update with loss and accuracy if available
+            metrics = {}
+            if 'loss' in outputs:
+                metrics['loss'] = f"{outputs['loss']:.4f}"
+            self.train_pbar.set_postfix(metrics)
+            self.train_pbar.update(1)
+    
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self.train_pbar is not None:
+            self.train_pbar.close()
+            self.train_pbar = None
+    
+    def on_validation_start(self, trainer, pl_module):
+        total_batches = sum(trainer.num_val_batches)
+        self.val_pbar = tqdm(
+            total=total_batches,
+            desc="Validation",
+            unit="batch",
+            leave=False
+        )
+    
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        if self.val_pbar is not None:
+            self.val_pbar.update(1)
+    
+    def on_validation_end(self, trainer, pl_module):
+        if self.val_pbar is not None:
+            self.val_pbar.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     # Experiment Management
@@ -120,7 +169,7 @@ def main():
         help="Define length of one curriculum epoch.",
     )
     parser.add_argument("--curriculum_start", type=int, default=3)
-    parser.add_argument("--eval_interval", type=int, default=500)
+    parser.add_argument("--eval_interval", type=int, default=2000)
     parser.add_argument("--eval_batch_size", type=int, default=50)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--n_embd", type=int, default=256)
@@ -129,7 +178,10 @@ def main():
     parser.add_argument("--n_ffwd_width", type=int, default=4)
     parser.add_argument("--n_ffwd_depth", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--seed", type=int, default=200)
+    parser.add_argument("--dataset_type", type=str, default="position_coupling", 
+                       choices=["absolute", "position_coupling"],
+                       help="Type of dataset to use")
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument(
         "--val_k",
@@ -141,7 +193,10 @@ def main():
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
-    max_pos2 = 3*args.max_val_digits
+    
+    # Calculate max position: offset_range (100) + sequence length
+    # Sequence length = 3L + 3 (for L-digit addition)
+    max_pos = 100 + 3 * args.max_val_digits + 3
 
     # 1. Data Module
     dm = AdditionDataModule(
@@ -152,7 +207,8 @@ def main():
         batch_size=args.batch_size,
         curriculum_start=args.curriculum_start,
         num_workers=0 if args.smoke_test else args.num_workers,
-        max_pos2=max_pos2
+        dataset_type=args.dataset_type,
+        seed=args.seed,
     )
     dm.setup()
 
@@ -174,7 +230,7 @@ def main():
             n_ffwd_width=args.n_ffwd_width,
             n_ffwd_depth=args.n_ffwd_depth,
             total_steps=5 if args.smoke_test else args.max_iters,
-            max_pos2=max_pos2,
+            max_pos=max_pos,
             pad_token=dm.stoi["#"],
             eq_token=dm.stoi["="],
             val_k=args.val_k,
@@ -184,7 +240,7 @@ def main():
     exp_dir = os.path.join("experiments", args.exp_name)
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(exp_dir, "checkpoints"),
-        filename="gpt-2d-add-{step:04d}-acc={val_avg_seq_acc:.4f}",
+        filename="gpt-abs-add-{step:04d}-acc={val_avg_seq_acc:.4f}",
         every_n_train_steps=args.eval_interval,
         save_top_k=3,
         monitor="val_avg_seq_acc",
@@ -193,6 +249,7 @@ def main():
     )
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
+    progress_bar = ProgressBarCallback()
 
     trainer_kwargs = {
         "max_steps": 5 if args.smoke_test else args.max_iters,
@@ -200,15 +257,15 @@ def main():
         "limit_val_batches": 2 if args.smoke_test else args.eval_batch_size,
         "limit_train_batches": 2 if args.smoke_test else args.steps_per_epoch,
         "reload_dataloaders_every_n_epochs": 1,
-        "callbacks": [checkpoint_callback, lr_monitor, ValidationTableCallback()],
+        "callbacks": [checkpoint_callback, lr_monitor, ValidationTableCallback(), progress_bar],
         "accelerator": "auto",
         "devices": 1,
         "gradient_clip_val": args.grad_clip,
         "logger": TensorBoardLogger("logs", name=args.exp_name),
+        "enable_progress_bar": False,  # Disable default progress bar to use our custom one
     }
 
     trainer = pl.Trainer(**trainer_kwargs)
-    # trainer.compile_model = True
 
     # Handle Automatic Resumption
     if not args.ckpt_path and not args.validate_only:
@@ -227,10 +284,12 @@ def main():
     else:
         # Debug print
         batch = next(iter(dm.train_dataloader()))
-        x, y, p1, p2 = batch
+        x, y, pos = batch
         print(f"\n--- Training Experiment: {args.exp_name} ---")
+        print(f"Dataset Type: {args.dataset_type}")
         decode = lambda l: "".join([dm.itos[i.item()] for i in l])
         print(f"Sample Input: {decode(x[0])}")
+        print(f"Sample Positions: {pos[0].tolist()}")
         print("---------------------------\n")
 
         trainer.fit(model, datamodule=dm, ckpt_path=args.ckpt_path)
@@ -245,19 +304,31 @@ def main():
         L = len(n1_str)
         prompt_str = f"{n1_str}+{n2_str}="
         tokens = [dm.stoi[c] for c in prompt_str]
-        p1 = ([1] * (L + 1)) + ([2] * (L + 1))
-        p2 = list(range(1, L + 1)) + [1] + list(range(1, L + 1)) + [1]
-
+        
+        # Position encoding based on dataset type
         offset = 50
-        p2 = [p + offset for p in p2]
-
+        if args.dataset_type == "absolute":
+            # Absolute positions: just sequential with an offset
+            pos = list(range(len(tokens)))
+            pos = [p + offset for p in pos]
+        elif args.dataset_type == "position_coupling":
+            # Position coupling: decreasing for operands, 0 for operators
+            # n1: [L, L-1, ..., 1], +: [0], n2: [L, L-1, ..., 1], =: [0]
+            pos_n1 = list(range(L, 0, -1))  # [3, 2, 1]
+            pos_plus = [0]
+            pos_n2 = list(range(L, 0, -1))  # [3, 2, 1]
+            pos_eq = [0]
+            pos = pos_n1 + pos_plus + pos_n2 + pos_eq
+            pos = [p + offset for p in pos]
+        
         x_in = torch.tensor([tokens], dtype=torch.long)
-        p1_in = torch.tensor([p1], dtype=torch.long)
-        p2_in = torch.tensor([p2], dtype=torch.long)
+        pos_in = torch.tensor([pos], dtype=torch.long)
 
-        generated = model.generate(x_in, p1_in, p2_in, max_new_tokens=L + 1)
+        generated = model.generate(x_in, pos_in, max_new_tokens=L + 1)
         decode = lambda l: "".join([dm.itos[i.item()] for i in l])
+        print(f"Dataset Type: {args.dataset_type}")
         print(f"Prompt: {prompt_str}")
+        print(f"Positions: {pos}")
         print(f"Output: {decode(generated[0][len(tokens) :])}")
 
 

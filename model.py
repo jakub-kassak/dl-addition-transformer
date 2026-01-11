@@ -97,6 +97,10 @@ class Block(nn.Module):
 
 
 class GPTLightningModule(pl.LightningModule):
+    """
+    This model is amended to be compatible to 1-dim PE
+    """
+
     def __init__(
         self,
         vocab_size,
@@ -108,7 +112,7 @@ class GPTLightningModule(pl.LightningModule):
         n_ffwd_width=4,
         n_ffwd_depth=1,
         total_steps=10000,
-        max_pos2=1500,
+        max_pos=1500,
         pad_token=-1,
         eq_token=-1,
         val_k=1,
@@ -118,11 +122,8 @@ class GPTLightningModule(pl.LightningModule):
 
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
 
-        # 2D Positional Embeddings
-        # pos1 range: 0 (pad), 1, 2, 3
-        self.pos1_embedding_table = nn.Embedding(4, n_embd)
-        # pos2 range: randomized offset + digit index + padding (0)
-        self.pos2_embedding_table = nn.Embedding(max_pos2, n_embd)
+        # Absolute Positional Embedding (1D)
+        self.pos_embedding_table = nn.Embedding(max_pos, n_embd)
 
         self.blocks = nn.Sequential(
             *[
@@ -146,14 +147,13 @@ class GPTLightningModule(pl.LightningModule):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, pos1_ids, pos2_ids, targets=None):
+    def forward(self, idx, pos_ids, targets=None):
         B, T = idx.shape
 
         tok_emb = self.token_embedding_table(idx)  # (B, T, n_embd)
-        pos1_emb = self.pos1_embedding_table(pos1_ids)  # (B, T, n_embd)
-        pos2_emb = self.pos2_embedding_table(pos2_ids)  # (B, T, n_embd)
+        pos_emb = self.pos_embedding_table(pos_ids)  # (B, T, n_embd)
 
-        x = tok_emb + pos1_emb + pos2_emb  # (B, T, n_embd)
+        x = tok_emb + pos_emb  # (B, T, n_embd)
 
         x = self.blocks(x)
         x = self.ln_f(x)
@@ -161,26 +161,22 @@ class GPTLightningModule(pl.LightningModule):
 
         loss = None
         if targets is not None:
-            # Mask out loss for tokens strictly before '='
-            # We want to predict starting from the token AFTER '='
-            # The input that predicts the first result digit is '=' itself.
-            # So valid inputs are: (input == eq_token) OR (pos1 == 3)
-            # pos1 == 3 corresponds to result digits.
-
-            # Mask: 1 for valid positions, 0 for ignored
-            # Make sure eq_token is valid
+            # Find '=' position to determine where to start computing loss
             if self.hparams.eq_token == -1:
-                # If not provided, assume we train on everything (backward compat)
                 raise Exception("eq_token must be provided")
-            else:
-                is_eq = idx == self.hparams.eq_token
-                is_result = pos1_ids == 3
-                keep_mask = is_eq | is_result
-
-                # Apply mask to targets: set ignored to pad_token
-                # We clone targets to avoid modifying the original tensor if it's used elsewhere
-                targets = targets.clone()
-                targets[~keep_mask] = self.hparams.pad_token
+            
+            # Mask: only compute loss on tokens at and after '='
+            # This includes the '=' token itself (which predicts first digit)
+            # and all subsequent tokens
+            eq_mask = idx == self.hparams.eq_token
+            
+            # Find the position of '=' in each sequence
+            # Create cumsum to mark everything from '=' onwards
+            keep_mask = eq_mask.cumsum(dim=1) > 0
+            
+            # Apply mask to targets
+            targets = targets.clone()
+            targets[~keep_mask] = self.hparams.pad_token
 
             # Flatten for loss calculation
             B, T, C = logits.shape
@@ -193,8 +189,8 @@ class GPTLightningModule(pl.LightningModule):
         return logits, loss
 
     def training_step(self, batch, batch_idx):
-        idx, targets, pos1_ids, pos2_ids = batch
-        logits, loss = self(idx, pos1_ids, pos2_ids, targets)
+        idx, targets, pos_ids = batch
+        logits, loss = self(idx, pos_ids, targets)
         self.log("train_loss", loss, on_step=True, on_epoch=False, prog_bar=True)
         self.log(
             "train/max_logits",
@@ -206,18 +202,27 @@ class GPTLightningModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        idx, targets, pos1_ids, pos2_ids = batch
-        L = (pos1_ids[0] == 1).sum() - 1
+        idx, targets, pos_ids = batch
+        
+        # Calculate L (number of digits in operands)
+        # Find '=' position
+        eq_positions = (idx == self.hparams.eq_token).nonzero(as_tuple=True)[1]
+        eq_pos = eq_positions[0].item() if len(eq_positions) > 0 else -1
+        
+        # Find '+' position
+        plus_token = 10  # Hardcoded based on vocab
+        plus_positions = (idx == plus_token).nonzero(as_tuple=True)[1]
+        plus_pos = plus_positions[0].item() if len(plus_positions) > 0 else -1
+        
+        L = plus_pos  # Number of digits in first operand
+        
         if batch_idx == 0:
-            print(f"DEBUG: validation_step L={L.item()}")
-        logits, loss = self(idx, pos1_ids, pos2_ids, targets)
-
-        # Determine dataset name via dataloader_idx
-        # But here we can just log with dataloader_idx or rely on automatic suffixes?
-        # Lightning adds /dataloader_idx_N
+            print(f"DEBUG: validation_step L={L}")
+        
+        logits, loss = self(idx, pos_ids, targets)
 
         self.log(
-           "val_loss",
+            "val_loss",
             loss,
             on_step=False,
             on_epoch=True,
@@ -226,24 +231,17 @@ class GPTLightningModule(pl.LightningModule):
         )
 
         # Accuracy Calculation
-        # Mask out padding
-        if self.hparams.eq_token == -1:
-            raise Exception("eq_token must be provided")
-        else:
-            is_eq = idx == self.hparams.eq_token
-            is_result = pos1_ids == 3
-            keep_mask = is_eq | is_result
-
-            # Apply mask to targets: set ignored to pad_token
-            # We clone targets to avoid modifying the original tensor if it's used elsewhere
-            targets = targets.clone()
-            targets[~keep_mask] = self.hparams.pad_token
+        eq_mask = idx == self.hparams.eq_token
+        keep_mask = eq_mask.cumsum(dim=1) > 0
+        
+        # Apply mask to targets
+        targets_masked = targets.clone()
+        targets_masked[~keep_mask] = self.hparams.pad_token
 
         preds = torch.argmax(logits, dim=-1)
-        correct = preds == targets
+        correct = preds == targets_masked
 
         # 1. Token-wise Accuracy
-        # Only count non-padding tokens
         token_acc = (correct & keep_mask).sum().float() / keep_mask.sum().float()
         self.log(
             "val_acc_token",
@@ -254,15 +252,7 @@ class GPTLightningModule(pl.LightningModule):
             add_dataloader_idx=True,
         )
 
-        # 2. Sequence-wise Accuracy (Whole Result)
-        # A sequence is correct if ALL its non-masked tokens are correct
-        # dim=1 is sequence dimension
-        # correct shape: (B, T)
-        # mask shape: (B, T)
-
-        # We need to ensure that for a given row, all positions where mask=True are correct.
-        # If mask=False, it doesn't matter (treat as correct).
-        # So check: correct | (~mask)
+        # 2. Sequence-wise Accuracy
         row_correct = (correct | (~keep_mask)).all(dim=1)
         seq_acc = row_correct.float().mean()
         self.log(
@@ -278,34 +268,29 @@ class GPTLightningModule(pl.LightningModule):
         if self.hparams.val_k > 1:
             # Find '=' position
             eq_indices = (idx == self.hparams.eq_token).nonzero(as_tuple=True)
-            # All items in batch have same '=' position in this dataset
             eq_idx = eq_indices[1][0].item()
 
             prefix_idx = idx[:, : eq_idx + 1]
-            prefix_p1 = pos1_ids[:, : eq_idx + 1]
-            prefix_p2 = pos2_ids[:, : eq_idx + 1]
+            prefix_pos = pos_ids[:, : eq_idx + 1]
 
             target_sum = targets[:, eq_idx:]  # (B, sum_len)
             target_mask = target_sum != self.hparams.pad_token
             sum_len = target_sum.shape[1]
 
             # Ground truth positions for the sum part
-            rest_p1 = pos1_ids[:, eq_idx + 1 :]
-            rest_p2 = pos2_ids[:, eq_idx + 1 :]
+            rest_pos = pos_ids[:, eq_idx + 1 :]
 
             k = self.hparams.val_k
             B = idx.shape[0]
 
             # Repeat for k samples
             x_k = prefix_idx.repeat_interleave(k, dim=0)
-            p1_k = prefix_p1.repeat_interleave(k, dim=0)
-            p2_k = prefix_p2.repeat_interleave(k, dim=0)
-            rp1_k = rest_p1.repeat_interleave(k, dim=0)
-            rp2_k = rest_p2.repeat_interleave(k, dim=0)
+            pos_k = prefix_pos.repeat_interleave(k, dim=0)
+            rest_pos_k = rest_pos.repeat_interleave(k, dim=0)
 
             # Generate (B*k, eq_idx + 1 + sum_len)
             out_k = self.generate(
-                x_k, p1_k, p2_k, max_new_tokens=sum_len, external_pos=(rp1_k, rp2_k)
+                x_k, pos_k, max_new_tokens=sum_len, external_pos=rest_pos_k
             )
             pred_sum_k = out_k[:, eq_idx + 1 :]  # (B*k, sum_len)
 
@@ -313,18 +298,14 @@ class GPTLightningModule(pl.LightningModule):
             pred_sum_k = pred_sum_k.view(B, k, sum_len)
 
             # 3a. Sequence-wise Majority Vote
-            # For each item in B, find the sequence that occurs most often among k
             final_pred_seq = []
             for i in range(B):
-                # Convert sequences to tuples for hashability
                 seqs = [tuple(s.tolist()) for s in pred_sum_k[i]]
                 most_common = max(set(seqs), key=seqs.count)
                 final_pred_seq.append(torch.tensor(most_common, device=self.device))
             final_pred_seq = torch.stack(final_pred_seq)  # (B, sum_len)
 
             # Calculate MV Seq Accuracy
-            # Sequence is correct if all non-pad tokens match
-            # But targets are already masked/padded correctly for the sum range
             seq_mv_correct = (final_pred_seq == target_sum) | (~target_mask)
             seq_mv_acc = seq_mv_correct.all(dim=1).float().mean()
             self.log(
@@ -332,16 +313,11 @@ class GPTLightningModule(pl.LightningModule):
             )
 
             # 3b. Digit-wise Majority Vote
-            # For each item in B and each digit position, find most frequent digit among k
-            # Using mode: returns (values, indices)
-            # pred_sum_k: (B, k, sum_len)
-            # Move to CPU because torch.mode is not implemented on MPS
             final_pred_digit = torch.mode(pred_sum_k.cpu(), dim=1).values.to(
                 self.device
             )  # (B, sum_len)
 
             digit_mv_correct = final_pred_digit == target_sum
-            # Mask out padding
             digit_mv_acc = (
                 digit_mv_correct & target_mask
             ).sum().float() / target_mask.sum().float()
@@ -399,48 +375,26 @@ class GPTLightningModule(pl.LightningModule):
         }
 
     @torch.no_grad()
-    def generate(self, idx, pos1_ids, pos2_ids, max_new_tokens, external_pos=None):
+    def generate(self, idx, pos_ids, max_new_tokens, external_pos=None):
         """
-        Generate tokens.
-        If external_pos=(p1, p2) is provided, use those positions.
-        Otherwise, attempt to infer next positions based on 2D logic.
+        Generate tokens with absolute positional encoding.
+        If external_pos is provided, use those positions.
+        Otherwise, increment position by 1 for each new token.
         """
         for i in range(max_new_tokens):
-            logits, _ = self(idx, pos1_ids, pos2_ids)
+            logits, _ = self(idx, pos_ids)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.argmax(probs, dim=-1, keepdim=True)
-            # idx_next = torch.multinomial(probs, num_samples=1)
 
             if external_pos is not None:
-                p1_ext, p2_ext = external_pos
-                next_pos1 = p1_ext[:, i : i + 1]
-                next_pos2 = p2_ext[:, i : i + 1]
+                next_pos = external_pos[:, i : i + 1]
             else:
-                # Infer positions
-                last_idx = idx[:, -1:]
-                last_p1 = pos1_ids[:, -1:]
-                last_p2 = pos2_ids[:, -1:]
-
-                # Default: stay in same p1, move p2
-                next_pos1 = last_p1.clone()
-                next_pos2 = last_p2.clone()
-
-                # Logic from data.py
-                # If last was '=', next p1 is 3, next p2 is 1
-                is_eq = last_idx == self.hparams.eq_token
-                next_pos1[is_eq] = 3
-                next_pos2[is_eq] = 1
-
-                # If we are in p1=3 (sum) and last was NOT '=', p2 increases
-                is_sum = (last_p1 == 3) & (~is_eq)
-                next_pos2[is_sum] += 1
-
-                # During pure generation (like spot check), we are only generating the sum.
-                # So we don't need the 'is_num' decrement logic which was for the prompt tokens themselves.
+                # Simply increment position by 1
+                last_pos = pos_ids[:, -1:]
+                next_pos = last_pos + 1
 
             idx = torch.cat((idx, idx_next), dim=1)
-            pos1_ids = torch.cat((pos1_ids, next_pos1), dim=1)
-            pos2_ids = torch.cat((pos2_ids, next_pos2), dim=1)
+            pos_ids = torch.cat((pos_ids, next_pos), dim=1)
 
         return idx

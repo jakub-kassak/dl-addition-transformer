@@ -52,23 +52,25 @@ class MultiOperandAdditionDataset(IterableDataset):
 
     def generate_batch(self):
         B = self.batch_size
-        N = random.randint(self.min_operands, self.max_operands)
+        N_Ops = random.randint(self.min_operands, self.max_operands)
+        N_Dig = random.randint(self.min_digits, self.max_digits)
+        # with open("logs/log.txt", "a") as f:
+        #     f.write(f"OPS: {self.min_operands}-{self.max_operands} => {N_Ops}, Digits: {self.min_digits}-{self.max_digits} => {N_Dig}\n")
 
         # 1. Determine max_len (padding everything to this length)
         # Allowance for carry: log10(max_operands)
-        carry_allowance = math.ceil(math.log10(self.max_operands))
-        max_len = self.max_digits + carry_allowance
+        carry_allowance = math.ceil(math.log10(N_Ops))
+        max_len = N_Dig + carry_allowance
 
         # 2. Generate Op Digits with strict padding
         # In Figure 4, operands are zero-padded to match the length of the result.
         operands_digits = []
-        for _ in range(N):
+        for _ in range(N_Ops):
             # Generate random number with 1 to max_digits
-            L_actual = random.randint(self.min_digits, self.max_digits)
-            d = torch.randint(0, 10, (B, L_actual))
+            d = torch.randint(0, 10, (B, N_Dig))
 
             # Pad to max_len with zeros (at the front/MSB for input)
-            padding = torch.zeros((B, max_len - L_actual), dtype=torch.long)
+            padding = torch.zeros((B, max_len - N_Dig), dtype=torch.long)
             full_d = torch.cat([padding, d], dim=1)
             operands_digits.append(full_d)
 
@@ -102,7 +104,7 @@ class MultiOperandAdditionDataset(IterableDataset):
         hash_t = torch.full((B, 1), self.hash_token, dtype=torch.long)
 
         # -- Input Phase --
-        for k in range(N):
+        for k in range(N_Ops):
             # Operand Nk gets PosID2 = k+1
             L = operands_digits[k].shape[1]
             tokens_list.append(operands_digits[k])
@@ -114,7 +116,7 @@ class MultiOperandAdditionDataset(IterableDataset):
             p2_list.append(ids)
             p3_list.append(torch.full((B, L), 1, dtype=torch.long))
 
-            if k < N - 1:
+            if k < N_Ops - 1:
                 # Separator [+]
                 tokens_list.append(plus)
                 p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
@@ -149,7 +151,7 @@ class MultiOperandAdditionDataset(IterableDataset):
 
         # End Token [#]
         tokens_list.append(hash_t)
-        p1_list.append(torch.full((B, 1), N + 1, dtype=torch.long))  # Final block
+        p1_list.append(torch.full((B, 1), N_Ops + 1, dtype=torch.long))  # Final block
         p2_list.append(torch.zeros((B, 1), dtype=torch.long))
         p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
 
@@ -168,6 +170,8 @@ class MultiOperandAdditionDataset(IterableDataset):
         p2 = pos2[:, :-1]
         p3 = pos3[:, :-1]
 
+        # with open("logs/log.txt", "a") as f:
+        #     f.write(f"x: {x[0]},\ny: {y[0]},\np1: {p1[0]},\np2: {p2[0]},\np3: {p3[0]}\n")
         return x, y, p1, p2, p3
 
 
@@ -310,45 +314,22 @@ class AdditionDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         # Dynamic validation sets based on current curriculum progress
-        current_max_digits = self.train_ds.max_digits
         max_val_digits = self.hparams.max_val_digits
         min_train_digits = self.hparams.min_train_digits
         val_step_digits = self.hparams.val_step
 
-        max_train_ops = self.hparams.max_operands
+        min_val_ops = self.hparams.min_operands
         max_val_ops = self.hparams.max_val_operands
         val_step_ops = self.hparams.val_operand_step
 
         # 1. Lengths Grid
         lengths = sorted(
-            list(
-                set(
-                    list(
-                        range(
-                            min_train_digits,
-                            max_val_digits + 1,
-                            max(1, val_step_digits),
-                        )
-                    )
-                    + [current_max_digits, min(current_max_digits + 1, max_val_digits)]
-                )
-            )
+            list(range(min_train_digits, max_val_digits + 1, max(1, val_step_digits)))
         )
 
         # 2. Operands Grid
         operands = sorted(
-            list(
-                set(
-                    [max_train_ops]
-                    + list(
-                        range(
-                            max_train_ops + val_step_ops,
-                            max_val_ops + 1,
-                            max(1, val_step_ops),
-                        )
-                    )
-                )
-            )
+            list(range(min_val_ops, max_val_ops + 1, max(1, val_step_ops)))
         )
 
         # Generate Configurations

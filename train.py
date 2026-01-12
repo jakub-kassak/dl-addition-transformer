@@ -252,7 +252,7 @@ def main():
         p1_in = torch.tensor([p1], dtype=torch.long)
         p2_in = torch.tensor([p2], dtype=torch.long)
 
-        generated = model.generate(x_in, p1_in, p2_in, max_new_tokens=L + 1)
+        generated = model.generate(x_in, p1_in, p2_in, max_new_tokens=max(L1, L2) + 1)
 
         # Improved decoding for 0-19 digits
         def decode_mod10(l):

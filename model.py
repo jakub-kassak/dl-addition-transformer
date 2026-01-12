@@ -246,8 +246,8 @@ class GPTLightningModule(pl.LightningModule):
             x = x + pos1_emb + pos2_emb  # (B, T, n_embd)
         elif self.hparams.pos_emb_type == "abc_mixed":
             # pos1 is added as learned absolute PE
-            pos1_emb = self.pos1_embedding_table(pos1_ids)  # (B, T, n_embd)
-            x = x + pos1_emb
+            # pos1_emb = self.pos1_embedding_table(pos1_ids)  # (B, T, n_embd)
+            # x = x + pos1_emb
             # pos2 is RoPE spanning the entire head dimension
             head_size = self.hparams.n_embd // self.hparams.n_head
             rope = self.rope(pos2_ids, head_size).unsqueeze(

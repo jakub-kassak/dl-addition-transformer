@@ -85,8 +85,8 @@ class VectorizedAdditionDataset(IterableDataset):
 
         pos2 = pos2_seq.unsqueeze(0).expand(B, -1)  # (B, SeqLen)
 
-        offsets = torch.randint(0, self.offset_range, (B, 1))
-        pos2 = pos2 + offsets
+        # offsets = torch.randint(0, self.offset_range, (B, 1))
+        # pos2 = pos2 + offsets
 
         # 5. Form (x, y)
         x = tokens[:, :-1]

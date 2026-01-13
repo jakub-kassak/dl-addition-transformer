@@ -37,7 +37,7 @@ class MultiHeadAttention(nn.Module):
         self.dropout_p = dropout
         self.resid_dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, return_weights=False, rope=None):
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
@@ -45,12 +45,61 @@ class MultiHeadAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        y = scaled_dot_product_attention(
-            q, k, v, dropout_p=self.dropout_p if self.training else 0, is_causal=True
-        )
+        if rope is not None:
+            # rope shape: (B, 1, T, head_size//2, 2, 2)
+            # q, k shape: (B, n_head, T, head_size)
+            shape = q.shape  # (B, n_head, T, head_size)
+
+            # Reshape q, k for RoPE: [B, n_head, T, head_size//2, 2]
+            q_rot = q.view(*shape[:-1], -1, 2)
+            k_rot = k.view(*shape[:-1], -1, 2)
+
+            # rope is (B, 1, T, head_size//2, 2, 2)
+            # We want [x*cos - y*sin, x*sin + y*cos]
+            # cos/sin shape: (B, 1, T, head_size//2)
+            # To multiply (B, n_head, T, head_size//2, 2) by (B, 1, T, head_size//2),
+            # we need to unsqueeze cos/sin to (B, 1, T, head_size//2, 1)
+            # q_rot:      (B, n_head, T, head_size//2, 2)
+            # cos/sin:    (B, 1, T, head_size//2, 1) -> broadcasting works
+            cos = rope[..., 0, 0].unsqueeze(1).unsqueeze(-1)
+            sin = rope[..., 1, 0].unsqueeze(1).unsqueeze(-1)
+
+            x_raw = q_rot[..., 0:1]
+            y_raw = q_rot[..., 1:2]
+
+            q_new = torch.cat(
+                [x_raw * cos - y_raw * sin, x_raw * sin + y_raw * cos], dim=-1
+            )
+
+            x_k = k_rot[..., 0:1]
+            y_k = k_rot[..., 1:2]
+            k_new = torch.cat([x_k * cos - y_k * sin, x_k * sin + y_k * cos], dim=-1)
+
+            # Reshape back to (B, n_head, T, head_size)
+            q = q_new.view(shape)
+            k = k_new.view(shape)
+
+        if return_weights:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / ((C // self.n_head) ** 0.5))
+            mask = torch.tril(torch.ones(T, T, device=q.device)).view(1, 1, T, T)
+            att = att.masked_fill(mask == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            y = att @ v
+        else:
+            y = scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.dropout_p if self.training else 0,
+                is_causal=True,
+            )
+            att = None
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
+
+        if return_weights:
+            return y, att
         return y
 
 
@@ -87,20 +136,22 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
-        return x
+    def forward(self, x, return_weights=False, rope=None):
+        if return_weights:
+            out, att = self.sa(self.ln1(x), return_weights=True, rope=rope)
+            x = x + out
+            x = x + self.ffwd(self.ln2(x))
+            return x, att
+        else:
+            x = x + self.sa(self.ln1(x), rope=rope)
+            x = x + self.ffwd(self.ln2(x))
+            return x
 
 
 # --- Lightning Module ---
 
 
 class GPTLightningModule(pl.LightningModule):
-    """
-    This model is amended to be compatible to 1-dim PE
-    """
-
     def __init__(
         self,
         vocab_size,
@@ -115,15 +166,20 @@ class GPTLightningModule(pl.LightningModule):
         max_pos=1500,
         pad_token=-1,
         eq_token=-1,
-        val_k=1,
+        rope_theta=20000,
+        pos_emb_type="rope",  # Options: "rope", "learned"
+        dataset_type="absolute",  # Options: "absolute", "position_coupling"
     ):
         super().__init__()
         self.save_hyperparameters()
-
+        self.theta = rope_theta
+        self.dataset_type = dataset_type
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
 
-        # Absolute Positional Embedding (1D)
-        self.pos_embedding_table = nn.Embedding(max_pos, n_embd)
+        if pos_emb_type in ["learned", "learned_PC"]:
+            # 1D Positional Embeddings
+            # pos range: randomized offset + digit index + padding (0)
+            self.pos_embedding_table = nn.Embedding(max_pos, n_embd)
 
         self.blocks = nn.Sequential(
             *[
@@ -147,36 +203,69 @@ class GPTLightningModule(pl.LightningModule):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, pos_ids, targets=None):
+    def rope(self, pos, head_size):
+        assert head_size % 2 == 0
+        scale = (
+            torch.arange(0, head_size, 2, dtype=pos.dtype, device=pos.device)
+            / head_size
+        )
+        radians = 1.0 / (self.theta**scale)
+        out = torch.einsum("...n,d->...nd", pos, radians)
+        cos, sin = torch.cos(out), torch.sin(out)
+        out = torch.stack([cos, -sin, sin, cos], dim=-1)
+        out = out.reshape(*out.shape[:-1], 2, 2)
+        return out
+
+    def forward(self, idx, pos_ids, targets=None, return_weights=False):
         B, T = idx.shape
 
-        tok_emb = self.token_embedding_table(idx)  # (B, T, n_embd)
-        pos_emb = self.pos_embedding_table(pos_ids)  # (B, T, n_embd)
+        x = self.token_embedding_table(idx)  # (B, T, n_embd)
 
-        x = tok_emb + pos_emb  # (B, T, n_embd)
+        rope = None
+        if self.hparams.pos_emb_type == "rope":
+            # Apply RoPE to the full head dimension
+            head_size = self.hparams.n_embd // self.hparams.n_head
+            rope = self.rope(pos_ids, head_size)
+        elif self.hparams.pos_emb_type == "learned":
+            pos_emb = self.pos_embedding_table(pos_ids)  # (B, T, n_embd)
+            x = x + pos_emb  # (B, T, n_embd)
+        else:
+            raise ValueError(f"Unknown pos_emb_type: {self.hparams.pos_emb_type}")
 
-        x = self.blocks(x)
+        all_attn = []
+        for block in self.blocks:
+            if return_weights:
+                x, att = block(x, return_weights=True, rope=rope)
+                all_attn.append(att)
+            else:
+                x = block(x, rope=rope)
+
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
         loss = None
         if targets is not None:
-            # Find '=' position to determine where to start computing loss
+            # Mask out loss for tokens strictly before '='
+            # We want to predict starting from the token AFTER '='
+            # The input that predicts the first result digit is '=' itself.
+            # So valid inputs are: (input == eq_token) OR (pos1 == 3)
+            # pos1 == 3 corresponds to result digits.
+
+            # Mask: 1 for valid positions, 0 for ignored
+            # Make sure eq_token is valid
             if self.hparams.eq_token == -1:
+                # If not provided, assume we train on everything (backward compat)
                 raise Exception("eq_token must be provided")
-            
-            # Mask: only compute loss on tokens at and after '='
-            # This includes the '=' token itself (which predicts first digit)
-            # and all subsequent tokens
-            eq_mask = idx == self.hparams.eq_token
-            
-            # Find the position of '=' in each sequence
-            # Create cumsum to mark everything from '=' onwards
-            keep_mask = eq_mask.cumsum(dim=1) > 0
-            
-            # Apply mask to targets
-            targets = targets.clone()
-            targets[~keep_mask] = self.hparams.pad_token
+            else:
+                # Only compute loss on result digits (after '=', excluding '=' itself)
+                eq_positions = (idx == self.hparams.eq_token).bool()  # Boolean tensor
+                # Mark everything AFTER '=' (cumsum > 0), then exclude '=' itself
+                after_eq = torch.cumsum(eq_positions.float(), dim=1) > 0  # Boolean tensor
+                keep_mask = after_eq & (~eq_positions)  # Both boolean, so ~ works
+                # Apply mask to targets: set ignored to pad_token
+                # We clone targets to avoid modifying the original tensor if it's used elsewhere
+                targets = targets.clone()
+                targets[~keep_mask] = self.hparams.pad_token
 
             # Flatten for loss calculation
             B, T, C = logits.shape
@@ -186,6 +275,8 @@ class GPTLightningModule(pl.LightningModule):
                 ignore_index=self.hparams.pad_token,
             )
 
+        if return_weights:
+            return logits, loss, all_attn
         return logits, loss
 
     def training_step(self, batch, batch_idx):
@@ -203,23 +294,11 @@ class GPTLightningModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         idx, targets, pos_ids = batch
-        
-        # Calculate L (number of digits in operands)
-        # Find '=' position
-        eq_positions = (idx == self.hparams.eq_token).nonzero(as_tuple=True)[1]
-        eq_pos = eq_positions[0].item() if len(eq_positions) > 0 else -1
-        
-        # Find '+' position
-        plus_token = 10  # Hardcoded based on vocab
-        plus_positions = (idx == plus_token).nonzero(as_tuple=True)[1]
-        plus_pos = plus_positions[0].item() if len(plus_positions) > 0 else -1
-        
-        L = plus_pos  # Number of digits in first operand
-        
-        if batch_idx == 0:
-            print(f"DEBUG: validation_step L={L}")
-        
         logits, loss = self(idx, pos_ids, targets)
+
+        # Determine dataset name via dataloader_idx
+        # But here we can just log with dataloader_idx or rely on automatic suffixes?
+        # Lightning adds /dataloader_idx_N
 
         self.log(
             "val_loss",
@@ -231,18 +310,26 @@ class GPTLightningModule(pl.LightningModule):
         )
 
         # Accuracy Calculation
-        eq_mask = idx == self.hparams.eq_token
-        keep_mask = eq_mask.cumsum(dim=1) > 0
+        # Mask out padding
+        if self.hparams.eq_token == -1:
+            raise Exception("eq_token must be provided")
+        else:
+            eq_positions = (idx == self.hparams.eq_token).bool()  # Boolean tensor
+            # Mark everything AFTER '=' (cumsum > 0), then exclude '=' itself
+            after_eq = torch.cumsum(eq_positions.float(), dim=1) > 0
+            result_mask = after_eq & (~eq_positions)  # Exclude '=' token
         
-        # Apply mask to targets
-        targets_masked = targets.clone()
-        targets_masked[~keep_mask] = self.hparams.pad_token
+            # Apply mask to targets: set ignored to pad_token
+            # We clone targets to avoid modifying the original tensor if it's used elsewhere
+            targets = targets.clone()
+            targets[~result_mask] = self.hparams.pad_token
 
         preds = torch.argmax(logits, dim=-1)
-        correct = preds == targets_masked
+        correct = preds == targets
 
         # 1. Token-wise Accuracy
-        token_acc = (correct & keep_mask).sum().float() / keep_mask.sum().float()
+        # Only count non-padding tokens
+        token_acc = (correct & result_mask).sum().float() / result_mask.sum().float()
         self.log(
             "val_acc_token",
             token_acc,
@@ -252,8 +339,16 @@ class GPTLightningModule(pl.LightningModule):
             add_dataloader_idx=True,
         )
 
-        # 2. Sequence-wise Accuracy
-        row_correct = (correct | (~keep_mask)).all(dim=1)
+        # 2. Sequence-wise Accuracy (Whole Result)
+        # A sequence is correct if ALL its non-masked tokens are correct
+        # dim=1 is sequence dimension
+        # correct shape: (B, T)
+        # mask shape: (B, T)
+
+        # We need to ensure that for a given row, all positions where mask=True are correct.
+        # If mask=False, it doesn't matter (treat as correct).
+        # So check: correct | (~mask)
+        row_correct = (correct | (~result_mask)).all(dim=1)
         seq_acc = row_correct.float().mean()
         self.log(
             "val_acc_seq",
@@ -264,65 +359,55 @@ class GPTLightningModule(pl.LightningModule):
             add_dataloader_idx=True,
         )
 
-        # 3. Majority Voting Validation
-        if self.hparams.val_k > 1:
-            # Find '=' position
-            eq_indices = (idx == self.hparams.eq_token).nonzero(as_tuple=True)
-            eq_idx = eq_indices[1][0].item()
+        # 3. Average Error Position (where do mistakes typically happen?)
+        # or sequences with no errors, we count them as "failing" at position = result_length + 1
+        B, T = idx.shape
+        first_error_positions = []
 
-            prefix_idx = idx[:, : eq_idx + 1]
-            prefix_pos = pos_ids[:, : eq_idx + 1]
+        for b in range(B):
+            seq_result_mask = result_mask[b]
+            seq_correct = correct[b]
+            seq_pos_ids = pos_ids[b]
 
-            target_sum = targets[:, eq_idx:]  # (B, sum_len)
-            target_mask = target_sum != self.hparams.pad_token
-            sum_len = target_sum.shape[1]
+            # Get result positions for this sequence
+            result_indices = torch.where(seq_result_mask)[0]
+            if len(result_indices) == 0:
+                continue
+            
+            result_length = len(result_indices)
 
-            # Ground truth positions for the sum part
-            rest_pos = pos_ids[:, eq_idx + 1 :]
+            # Find first incorrect position
+            found_error = False
+            for ridx in result_indices:
+                if not seq_correct[ridx]:
+                    # Found first error - record its digit position
+                    if self.dataset_type == "position_coupling":
+                        # Subtract the minimum position in result to get relative position
+                        result_pos_values = seq_pos_ids[seq_result_mask]
+                        min_result_pos = result_pos_values.min().item()
+                        relative_pos = seq_pos_ids[ridx].item() - min_result_pos + 1
+                        first_error_positions.append(relative_pos)
+                    else:  # absolute positioning
+                        # Calculate relative position from start of result
+                        rel_pos = (ridx - result_indices[0]).item() + 1
+                        first_error_positions.append(rel_pos)
+                    found_error = True
+                    break
+                
+            if not found_error:
+                # No error found - sequence is entirely correct
+                # Record as "failing" at position beyond the last digit
+                first_error_positions.append(result_length + 1)
 
-            k = self.hparams.val_k
-            B = idx.shape[0]
-
-            # Repeat for k samples
-            x_k = prefix_idx.repeat_interleave(k, dim=0)
-            pos_k = prefix_pos.repeat_interleave(k, dim=0)
-            rest_pos_k = rest_pos.repeat_interleave(k, dim=0)
-
-            # Generate (B*k, eq_idx + 1 + sum_len)
-            out_k = self.generate(
-                x_k, pos_k, max_new_tokens=sum_len, external_pos=rest_pos_k
-            )
-            pred_sum_k = out_k[:, eq_idx + 1 :]  # (B*k, sum_len)
-
-            # Reshape to (B, k, sum_len)
-            pred_sum_k = pred_sum_k.view(B, k, sum_len)
-
-            # 3a. Sequence-wise Majority Vote
-            final_pred_seq = []
-            for i in range(B):
-                seqs = [tuple(s.tolist()) for s in pred_sum_k[i]]
-                most_common = max(set(seqs), key=seqs.count)
-                final_pred_seq.append(torch.tensor(most_common, device=self.device))
-            final_pred_seq = torch.stack(final_pred_seq)  # (B, sum_len)
-
-            # Calculate MV Seq Accuracy
-            seq_mv_correct = (final_pred_seq == target_sum) | (~target_mask)
-            seq_mv_acc = seq_mv_correct.all(dim=1).float().mean()
+        if len(first_error_positions) > 0:
+            avg_first_error_pos = sum(first_error_positions) / len(first_error_positions)
             self.log(
-                "val_acc_seq_mv", seq_mv_acc, on_epoch=True, add_dataloader_idx=True
-            )
-
-            # 3b. Digit-wise Majority Vote
-            final_pred_digit = torch.mode(pred_sum_k.cpu(), dim=1).values.to(
-                self.device
-            )  # (B, sum_len)
-
-            digit_mv_correct = final_pred_digit == target_sum
-            digit_mv_acc = (
-                digit_mv_correct & target_mask
-            ).sum().float() / target_mask.sum().float()
-            self.log(
-                "val_acc_digit_mv", digit_mv_acc, on_epoch=True, add_dataloader_idx=True
+                "val_avg_first_error_pos",
+                avg_first_error_pos,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=True,
             )
 
         return loss
@@ -333,11 +418,16 @@ class GPTLightningModule(pl.LightningModule):
 
         # Collect all per-dataloader metrics
         seq_accs = [v for k, v in metrics.items() if "val_acc_seq/dataloader_idx_" in k]
+        digit_accs = [v for k, v in metrics.items() if "val_digit_acc/dataloader_idx_" in k]
         losses = [v for k, v in metrics.items() if "val_loss/dataloader_idx_" in k]
 
         if seq_accs:
             avg_seq_acc = torch.stack(seq_accs).mean()
             self.log("val_avg_seq_acc", avg_seq_acc, prog_bar=True)
+        
+        if digit_accs:
+            avg_digit_acc = torch.stack(digit_accs).mean()
+            self.log("val_avg_digit_acc", avg_digit_acc, prog_bar=True)
 
         if losses:
             avg_loss = torch.stack(losses).mean()
@@ -374,27 +464,44 @@ class GPTLightningModule(pl.LightningModule):
             },
         }
 
+
     @torch.no_grad()
-    def generate(self, idx, pos_ids, max_new_tokens, external_pos=None):
-        """
-        Generate tokens with absolute positional encoding.
-        If external_pos is provided, use those positions.
-        Otherwise, increment position by 1 for each new token.
-        """
+    def generate(self, idx, pos_ids, max_new_tokens):
         for i in range(max_new_tokens):
             logits, _ = self(idx, pos_ids)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.argmax(probs, dim=-1, keepdim=True)
-
-            if external_pos is not None:
-                next_pos = external_pos[:, i : i + 1]
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            if self.hparams.dataset_type == "position_coupling":
+                # Check if '=' is in the sequence
+                has_eq = (idx == self.hparams.eq_token).any(dim=1)
+                
+                if has_eq.all():
+                    # We're generating result tokens
+                    # Count how many result tokens generated so far (after '=')
+                    eq_positions = (idx == self.hparams.eq_token)
+                    # Find index of '=' token
+                    eq_idx = torch.where(eq_positions[0])[0][0].item()
+                    # Count tokens after '='
+                    num_result_tokens = idx.size(1) - eq_idx - 1
+                    
+                    # Infer offset from existing positions
+                    offset = pos_ids.min().item()
+                    
+                    # Next position: offset + (1, 2, 3, ...) for (units, tens, hundreds, ...)
+                    # num_result_tokens is 0-indexed, so +1 gives us 1, 2, 3, ...
+                    next_pos = torch.tensor([[offset + num_result_tokens + 1]], 
+                                           dtype=pos_ids.dtype, device=pos_ids.device)
+                else:
+                    # Haven't reached '=' yet, increment normally
+                    next_pos = pos_ids[:, -1:] + 1
             else:
-                # Simply increment position by 1
-                last_pos = pos_ids[:, -1:]
-                next_pos = last_pos + 1
-
+                # Absolute positioning: just increment
+                next_pos = pos_ids[:, -1:] + 1
+            
             idx = torch.cat((idx, idx_next), dim=1)
             pos_ids = torch.cat((pos_ids, next_pos), dim=1)
-
+        
         return idx
+

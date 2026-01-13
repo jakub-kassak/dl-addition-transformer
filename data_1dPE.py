@@ -12,7 +12,7 @@ class AbsolutePositionAdditionDataset(IterableDataset):
     n1, n2 are L-digit numbers (or smaller padded).
     Uses absolute position encoding with same offset in a batch.
     """
-    def __init__(self, min_digits, max_digits, batch_size, offset_range=100, seed=None):
+    def __init__(self, min_digits, max_digits, batch_size, offset_range=20, seed=None):
         super().__init__()
         self.min_digits = min_digits
         self.max_digits = max_digits
@@ -162,7 +162,7 @@ class AdditionDataModule(pl.LightningDataModule):
         num_workers=0,
         curriculum_start=3,
         seed=None,
-        dataset_type="absolute",  # "absolute" or "position_coupling"
+        dataset_type="position_coupling",  # "absolute" or "position_coupling"
     ):
         super().__init__()
         self.save_hyperparameters()

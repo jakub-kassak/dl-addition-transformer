@@ -123,6 +123,13 @@ def main():
         choices=["rope", "learned", "abc_mixed"],
         help="Type of positional embedding to use.",
     )
+    parser.add_argument(
+        "--curriculum_type",
+        type=str,
+        default="ascend",
+        choices=["ascend", "random", "descend"], 
+        help="Strategies for Data Learning by Difficulty Level",
+    )
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -159,6 +166,7 @@ def main():
             eq_token=dm.stoi["="],
             rope_theta=args.rope_theta,
             pos_emb_type=args.pos_emb_type,
+            curriculum_type = args.curriculum_type
         )
 
     # 3. Trainer Setup
@@ -252,7 +260,7 @@ def main():
         p1_in = torch.tensor([p1], dtype=torch.long)
         p2_in = torch.tensor([p2], dtype=torch.long)
 
-        generated = model.generate(x_in, p1_in, p2_in, max_new_tokens=L + 1)
+        generated = model.generate(x_in, p1_in, p2_in, max_new_tokens=max(L1, L2) + 1)
 
         # Improved decoding for 0-19 digits
         def decode_mod10(l):

@@ -156,23 +156,38 @@ class AdditionDataModule(pl.LightningDataModule):
         self.stoi = self.train_ds.stoi
         self.itos = self.train_ds.itos
 
+    # def train_dataloader(self):
+    #     if hasattr(self, 'train_ds'):
+    #         print(f"\n🚀 创建训练 DataLoader")
+    #         print(f"   当前数据集设置: "
+    #               f"min_digits={self.train_ds.min_digits}, "
+    #               f"max_digits={self.train_ds.max_digits}")
+    #     return DataLoader(
+    #         self.train_ds, batch_size=None, num_workers=self.hparams.num_workers
+    #     )
     def train_dataloader(self):
+        if hasattr(self, 'train_ds'):
+            print(f"\n🚀 Creating Training DataLoader")
+            print(f"   min_digits={self.train_ds.min_digits}, max_digits={self.train_ds.max_digits}")
+            
+            # 获取一个批次并打印前5条
+            iterator = iter(self.train_ds)
+            x, y, p1, p2 = next(iterator)
+            
+            print(f"   Batch size: {x.shape[0]}, Seq length: {x.shape[1]}")
+            print(f"   First 5 samples (showing input tokens only):")
+            
+            for i in range(min(5, x.shape[0])):
+                # 解码token为可读格式
+                input_tokens = x[i].tolist()
+                input_str = ''.join([self.itos[t] if t < len(self.itos) else f'[{t}]' for t in input_tokens])
+                
+                print(f"   [{i}] {input_str}")
+        
         return DataLoader(
             self.train_ds, batch_size=None, num_workers=self.hparams.num_workers
         )
 
-    def on_train_epoch_start(self):
-        # Curriculum: At epoch 0, max_digits = curriculum_start
-        # Each epoch increases max_digits by 1 until max_train_digits
-        current_epoch = self.trainer.current_epoch
-        new_max = min(
-            self.hparams.curriculum_start + current_epoch, self.hparams.max_train_digits
-        )
-        self.train_ds.max_digits = new_max
-        print("\n" + "=" * 50)
-        print(f"🚀 CURRICULUM UPDATE: Epoch {current_epoch}")
-        print(f"   Training range: 1-{new_max} digits")
-        print("=" * 50 + "\n")
 
     def val_dataloader(self):
         # Dynamic validation sets based on current curriculum progress

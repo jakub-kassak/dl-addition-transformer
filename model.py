@@ -168,6 +168,7 @@ class GPTLightningModule(pl.LightningModule):
         eq_token=-1,
         rope_theta=20000,
         pos_emb_type="rope",
+        curriculum_type="ascend"
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -380,6 +381,120 @@ class GPTLightningModule(pl.LightningModule):
         )
 
         return loss
+
+
+    def _apply_curriculum_update(self, current_epoch):
+        """
+        Core logic for applying curriculum learning updates.
+        This function updates the training dataset difficulty
+        (i.e., max_digits) based on the selected curriculum strategy.
+        """
+
+        # 1) Retrieve datamodule and training dataset
+        dm = getattr(self.trainer, "datamodule", None)
+        if dm is None or not hasattr(dm, "train_ds"):
+            # Safety check: datamodule may not be initialized yet
+            return
+
+        train_ds = dm.train_ds
+
+        # 2) Retrieve curriculum parameters
+        curriculum_start = int(getattr(dm.hparams, "curriculum_start", 1))
+        max_train_digits = int(
+            getattr(dm.hparams, "max_train_digits", train_ds.max_digits)
+        )
+        curriculum_type = getattr(self.hparams, "curriculum_type", "ascend")
+
+        # 3) Initialize curriculum state (only once)
+        if not hasattr(self, "_curriculum_state"):
+            self._curriculum_state = {
+                "ascend_done": False,
+                "descend_stage": 1,        # 1: descending phase, 2: hold phase
+                "random_used": set(),      # difficulty levels already used
+                "random_all_used": False,  # whether all difficulty levels are used
+            }
+
+        # 4) Compute the new max_digits according to the strategy
+        new_max = max_train_digits  # default fallback
+
+        if curriculum_type == "ascend":
+            # Ascending curriculum: start from curriculum_start and increase by 1 each epoch
+            if not self._curriculum_state["ascend_done"]:
+                new_max = min(curriculum_start + current_epoch, max_train_digits)
+                if new_max >= max_train_digits:
+                    self._curriculum_state["ascend_done"] = True
+            else:
+                new_max = max_train_digits
+
+        elif curriculum_type == "descend":
+            # Descending curriculum: start from max difficulty and decrease by 1 each epoch
+            # Once reaching curriculum_start, switch to full difficulty
+            if self._curriculum_state["descend_stage"] == 1:
+                new_max = max(max_train_digits - current_epoch, curriculum_start)
+                if (max_train_digits - current_epoch) < curriculum_start:
+                    self._curriculum_state["descend_stage"] = 2
+                    new_max = max_train_digits
+            else:
+                new_max = max_train_digits
+
+        elif curriculum_type == "random":
+            # Random curriculum: randomly visit each difficulty level once
+            # After all levels are visited, switch to full difficulty
+            if not self._curriculum_state["random_all_used"]:
+                all_levels = list(range(curriculum_start, max_train_digits + 1))
+
+                unused_levels = [
+                    level for level in all_levels
+                    if level not in self._curriculum_state["random_used"]
+                ]
+
+                if unused_levels:
+                    import random
+                    new_max = random.choice(unused_levels)
+                    self._curriculum_state["random_used"].add(new_max)
+
+                    if len(self._curriculum_state["random_used"]) == len(all_levels):
+                        self._curriculum_state["random_all_used"] = True
+                else:
+                    new_max = max_train_digits
+                    self._curriculum_state["random_all_used"] = True
+            else:
+                new_max = max_train_digits
+
+        else:
+            # Fallback: always use maximum difficulty
+            new_max = max_train_digits
+
+        # 5) Apply the update to the training dataset
+        train_ds.max_digits = new_max
+
+        # 6) Logging (only on global rank 0)
+        if self.trainer.is_global_zero:
+            print("\n" + "=" * 50)
+            print(f"🚀 CURRICULUM UPDATE: Epoch {current_epoch}")
+            print(f"   Strategy: {curriculum_type}")
+            print(f"   Training range: {train_ds.min_digits}-{new_max} digits")
+
+            if curriculum_type == "random":
+                used_count = len(self._curriculum_state["random_used"])
+                total_levels = max_train_digits - curriculum_start + 1
+                print(f"   Used levels: {used_count}/{total_levels}")
+
+            print("=" * 50 + "\n")
+
+            with open("curriculum_debug.log", "a+", encoding="utf-8") as f:
+                f.write(
+                    f"Epoch {current_epoch}, strategy={curriculum_type}, max_digits={new_max}\n"
+                )
+
+
+    def on_fit_start(self):
+        self._apply_curriculum_update(self.trainer.current_epoch)
+
+    def on_train_epoch_end(self):
+        current_epoch = int(self.trainer.current_epoch) + 1
+
+        self._apply_curriculum_update(current_epoch=current_epoch)
 
     def on_validation_epoch_end(self):
         # Calculate average metrics across all validation dataloaders

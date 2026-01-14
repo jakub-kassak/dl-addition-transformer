@@ -1,0 +1,9 @@
+torch
+pytorch-lightning
+numpy
+matplotlib
+seaborn
+rich
+tqdm
+tensorboard
+wandb

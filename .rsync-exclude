@@ -1,0 +1,5 @@
+.venv_cluster
+__pycache__
+.git
+.vscode
+.DS_Store

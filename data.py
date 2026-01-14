@@ -11,11 +11,12 @@ class VectorizedAdditionDataset(IterableDataset):
     n1, n2 are L-digit numbers (or smaller padded).
     """
 
-    def __init__(self, min_digits, max_digits, batch_size, offset_range=100):
+    def __init__(self, min_digits, max_digits, batch_size, explicit_carry, offset_range=100):
         super().__init__()
         self.min_digits = min_digits
         self.max_digits = max_digits
         self.batch_size = batch_size
+        self.explicit_carry = explicit_carry
         self.offset_range = offset_range
 
         self.chars = [str(i) for i in range(20)] + ["+", "="]
@@ -51,6 +52,8 @@ class VectorizedAdditionDataset(IterableDataset):
             d2 = n2_digits[:, i]
             total = d1 + d2 + carry
             carry = total // 10
+            if not self.explicit_carry:
+                total = total % 10
             s_digits_rev.append(total)
 
         # Final carry becomes the MSB of the sum
@@ -106,7 +109,7 @@ class AdditionDataModule(pl.LightningDataModule):
         val_step=3,
         batch_size=64,
         num_workers=0,
-        curriculum_start=3,
+        explicit_carry=True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -118,6 +121,7 @@ class AdditionDataModule(pl.LightningDataModule):
             self.hparams.min_train_digits,
             self.hparams.max_train_digits,
             self.hparams.batch_size,
+            explicit_carry=self.hparams.explicit_carry,
         )
 
         # Validation datasets: Multiple datasets for generalization
@@ -141,7 +145,10 @@ class AdditionDataModule(pl.LightningDataModule):
         # 1. In-distribution set
         self.val_datasets.append(
             VectorizedAdditionDataset(
-                train_dist_val, train_dist_val, self.hparams.batch_size
+                train_dist_val,
+                train_dist_val,
+                self.hparams.batch_size,
+                explicit_carry=self.hparams.explicit_carry,
             )
         )
         self.val_names.append(f"val_L{train_dist_val}")
@@ -149,7 +156,12 @@ class AdditionDataModule(pl.LightningDataModule):
         # 2. Generalization sets
         for L in val_lengths:
             self.val_datasets.append(
-                VectorizedAdditionDataset(L, L, self.hparams.batch_size)
+                VectorizedAdditionDataset(
+                    L,
+                    L,
+                    self.hparams.batch_size,
+                    explicit_carry=self.hparams.explicit_carry,
+                )
             )
             self.val_names.append(f"val_L{L}")
 
@@ -161,41 +173,24 @@ class AdditionDataModule(pl.LightningDataModule):
             self.train_ds, batch_size=None, num_workers=self.hparams.num_workers
         )
 
-    def on_train_epoch_start(self):
-        # Curriculum: At epoch 0, max_digits = curriculum_start
-        # Each epoch increases max_digits by 1 until max_train_digits
-        current_epoch = self.trainer.current_epoch
-        new_max = min(
-            self.hparams.curriculum_start + current_epoch, self.hparams.max_train_digits
-        )
-        self.train_ds.max_digits = new_max
-        print("\n" + "=" * 50)
-        print(f"🚀 CURRICULUM UPDATE: Epoch {current_epoch}")
-        print(f"   Training range: 1-{new_max} digits")
-        print("=" * 50 + "\n")
-
     def val_dataloader(self):
-        # Dynamic validation sets based on current curriculum progress
-        current_max = self.train_ds.max_digits
         max_val = self.hparams.max_val_digits
         min_train = self.hparams.min_train_digits
         val_step = self.hparams.val_step
 
         # 1. Regular Grid (Coarse view across entire range)
         # e.g., 1, 5, 9, 13, 17... if step is 4
-        lengths_grid = list(range(min_train, max_val + 1, max(1, val_step)))
-
-        # 2. Critical Curriculum Points
-        # Always check exactly where we are training, and the immediate next step
-        curriculum_points = [current_max, min(current_max + 1, max_val)]
-
-        # Combine and Deduplicate
-        lengths = sorted(list(set(lengths_grid + curriculum_points)))
+        lengths = list(range(min_train, max_val + 1, max(1, val_step)))
 
         dataloaders = []
         self.val_names = []  # Reset and repopulate
         for L in lengths:
-            ds = VectorizedAdditionDataset(L, L, self.hparams.batch_size)
+            ds = VectorizedAdditionDataset(
+                L,
+                L,
+                self.hparams.batch_size,
+                explicit_carry=self.hparams.explicit_carry,
+            )
             dataloaders.append(
                 DataLoader(
                     ds,

@@ -9,6 +9,7 @@ def main():
     parser.add_argument("--max_digits", type=int, default=7)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--n_samples", type=int, default=3)
+    parser.add_argument("--explicit-carry", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     print(f"--- Data Inspection (L={args.min_digits}-{args.max_digits}) ---")
@@ -18,7 +19,7 @@ def main():
         min_train_digits=args.min_digits,
         max_train_digits=args.max_digits,
         batch_size=args.batch_size,
-        curriculum_start=args.max_digits,  # Force max digits immediately for inspection
+        explicit_carry=args.explicit_carry,
     )
     dm.setup()
 

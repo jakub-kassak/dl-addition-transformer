@@ -101,9 +101,8 @@ def main():
         "--steps_per_epoch",
         type=int,
         default=1000,
-        help="Define length of one curriculum epoch.",
+        help="Define length of one epoch.",
     )
-    parser.add_argument("--curriculum_start", type=int, default=3)
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--n_embd", type=int, default=256)
@@ -123,6 +122,12 @@ def main():
         choices=["rope", "learned", "abc_mixed"],
         help="Type of positional embedding to use.",
     )
+    parser.add_argument(
+        "--explicit-carry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to include carry information in the input strings.",
+    )
     args = parser.parse_args()
 
     pl.seed_everything(args.seed)
@@ -134,8 +139,8 @@ def main():
         max_val_digits=args.max_val_digits,
         val_step=args.val_step,
         batch_size=args.batch_size,
-        curriculum_start=args.curriculum_start,
         num_workers=0 if args.smoke_test else args.num_workers,
+        explicit_carry=args.explicit_carry,
     )
     dm.setup()
 

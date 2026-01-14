@@ -351,7 +351,10 @@ class AdditionDataModule(pl.LightningDataModule):
 
         # Normalize curriculum start immediately
         # This ensures setup() results are consistent regardless of max_train_digits
-        initial_max = min(self.hparams.curriculum_start, self.hparams.max_train_digits)
+        if self.hparams.data_type == "default":
+            initial_max = min(self.hparams.curriculum_start, self.hparams.max_train_digits)
+        elif self.hparams.data_type == "digit_combinations":
+            initial_max = self.hparams.max_train_digits
         self.train_ds.max_digits = initial_max
 
         if self.hparams.curriculum_operands_start is not None:

@@ -21,6 +21,8 @@ class MultiOperandAdditionDataset(IterableDataset):
         data_mode="variable",  # "padded" or "variable"
         offset_range=100,
         random_offsets=True,
+        data_type="default" 
+        #digit_combinations- puts all combinations of operands and digits in single batch- no cirriculum training 
     ):
         super().__init__()
         self.min_digits = min_digits
@@ -31,6 +33,7 @@ class MultiOperandAdditionDataset(IterableDataset):
         self.data_mode = data_mode
         self.offset_range = offset_range
         self.random_offsets = random_offsets
+        self.data_type = data_type
 
         # Vocab: 0-19 (digits+carry), +, =, >, #
         self.chars = [str(i) for i in range(20)] + ["+", "=", ">", "#"]
@@ -48,14 +51,15 @@ class MultiOperandAdditionDataset(IterableDataset):
 
     def __iter__(self):
         while True:
+            with open("logs/log.txt", "a") as f:
+                f.write(f"TRAINING \n")
             yield self.generate_batch()
 
-    def generate_batch(self):
+    def genereate_default_operands(self, N_Ops):
         B = self.batch_size
-        N_Ops = random.randint(self.min_operands, self.max_operands)
         N_Dig = random.randint(self.min_digits, self.max_digits)
-        # with open("logs/log.txt", "a") as f:
-        #     f.write(f"OPS: {self.min_operands}-{self.max_operands} => {N_Ops}, Digits: {self.min_digits}-{self.max_digits} => {N_Dig}\n")
+        with open("logs/log.txt", "a") as f:
+            f.write(f"OPS: {self.min_operands}-{self.max_operands} => {N_Ops}, Digits: {self.min_digits}-{self.max_digits} => {N_Dig}\n")
 
         # 1. Determine max_len (padding everything to this length)
         # Allowance for carry: log10(max_operands)
@@ -73,13 +77,63 @@ class MultiOperandAdditionDataset(IterableDataset):
             padding = torch.zeros((B, max_len - N_Dig), dtype=torch.long)
             full_d = torch.cat([padding, d], dim=1)
             operands_digits.append(full_d)
+        
+        return operands_digits, max_len
+    
+    def generate_varied_digits_per_operand(self, N_Ops):
+        operand_digits = []
+        B = self.batch_size
+        with open("logs/log.txt", "a") as f:
+            f.write(f"OPS: {self.min_operands}-{self.max_operands} => {N_Ops} \n")
+        num_digits = self.max_digits - self.min_digits + 1
+
+        # 1. Determine max_len (padding everything to this length)
+        # Allowance for carry: log10(max_operands)
+        carry_allowance = math.ceil(math.log10(self.max_operands))
+        max_len = self.max_digits + carry_allowance
+
+        ## split batch into chunks where digits will vary
+        base, rem = divmod(B, num_digits)
+        chunk_sizes = [base] * num_digits
+        for i in torch.randperm(num_digits)[:rem].tolist():  # randomize who gets the +1
+            chunk_sizes[i] += 1
+        
+        ## generate a batch
+        for _ in range(N_Ops):
+            batch = torch.empty(B, max_len, dtype=torch.long)
+            idx = 0
+            for i, size in enumerate(chunk_sizes):
+                n_dig = self.min_digits + i
+                
+                d = torch.randint(0, 10, (size, n_dig))
+
+                # Pad to max_len with zeros (at the front/MSB for input)
+                padding = torch.zeros((size, max_len - n_dig), dtype=torch.long)
+                full_d = torch.cat([padding, d], dim=1)
+                batch[idx : idx + size] = full_d
+                idx += size
+            operand_digits.append(batch)
+
+        return operand_digits, max_len
+
+    def generate_batch(self):
+        B = self.batch_size
+        operands_digits = []
+        max_len = 0
+        N_Ops = random.randint(self.min_operands, self.max_operands)
+
+        if self.data_type == "default":
+            operands_digits, max_len = self.genereate_default_operands(N_Ops)
+        elif self.data_type == "digit_combinations":
+            operands_digits, max_len = self.generate_varied_digits_per_operand(N_Ops)
+        
 
         # 3. Compute Partial Sums (S0=0, S1=N1, ..., SN=Sum(N1..NN))
         # Each Si is stored LSB-first in scratchpad_segments (length max_len)
         scratchpad_segments = []
         current_sum = torch.zeros((B, max_len), dtype=torch.long)
         scratchpad_segments.append(current_sum.clone())
-
+       
         for operand in operands_digits:
             carry = torch.zeros(B, dtype=torch.long)
             for i in range(max_len - 1, -1, -1):
@@ -89,9 +143,9 @@ class MultiOperandAdditionDataset(IterableDataset):
                 total = d_acc + d_op + carry
                 carry = total // 10
                 current_sum[:, i] = total
-
             scratchpad_segments.append(current_sum.flip(1))
             current_sum %= 10
+        # print(scratchpad_segments)
 
         # 4. Construct Full Sequence
         # Input: N1 + N2 + ... + Nk =
@@ -222,7 +276,10 @@ class SequentialMultiOperandAdditionDataset(IterableDataset):
         self.itos = self.template_ds.itos
 
     def __iter__(self):
+        with open("logs/log.txt", "a") as f:
+            f.write(f"VALIDATING \n")
         worker_info = torch.utils.data.get_worker_info()
+
 
         # If multiple workers, we need to split the work?
         # Actually validation usually doesn't need strict splitting effectively if we just want "some" samples.
@@ -272,6 +329,7 @@ class AdditionDataModule(pl.LightningDataModule):
         max_val_operands=10,
         val_operand_step=2,
         data_mode="variable",
+        data_type="default",
         curriculum_operands_start=None,
     ):
         super().__init__()
@@ -288,6 +346,7 @@ class AdditionDataModule(pl.LightningDataModule):
             max_operands=self.hparams.max_operands,
             data_mode=self.hparams.data_mode,
             random_offsets=self.hparams.random_offsets,
+            data_type=self.hparams.data_type,
         )
 
         # Normalize curriculum start immediately

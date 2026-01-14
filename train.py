@@ -91,6 +91,7 @@ def print_data_sample(dm, max_digits, debug_data=False, prefix=""):
         min_operands=2,
         max_operands=dm.hparams.max_operands,
         data_mode=dm.hparams.data_mode,
+        data_type=dm.hparams.data_type,
     )
     batch = temp_ds.generate_batch()
     x, y, p1, p2, p3 = batch
@@ -143,18 +144,21 @@ class CurriculumLoggerCallback(Callback):
         if hasattr(dm, "train_ds"):
             # Update Curriculum
             current_epoch = trainer.current_epoch
-            new_max = min(
-                dm.hparams.curriculum_start + current_epoch, dm.hparams.max_train_digits
-            )
-            dm.train_ds.max_digits = new_max
+            if dm.hparams.data_type == "default":
+                new_max = min(
+                    dm.hparams.curriculum_start + current_epoch, dm.hparams.max_train_digits
+                )
+                dm.train_ds.max_digits = new_max
 
-            pl_module.log(
-                "curriculum/max_digits",
-                float(new_max),
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-            )
+                pl_module.log(
+                    "curriculum/max_digits",
+                    float(new_max),
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=True,
+                )
+            elif dm.hparams.data_type == "digit_combinations":
+                new_max = dm.train_ds.max_digits
 
             # Update Operands Curriculum
             if dm.hparams.curriculum_operands_start is not None:
@@ -172,20 +176,24 @@ class CurriculumLoggerCallback(Callback):
                 )
             else:
                 new_ops = dm.train_ds.max_operands
+            
+            with open("logs/log.txt", "a") as f:
+                f.write(f"UPDATE: max-ops {new_ops}")
 
             # Print sample if curriculum advanced OR if debug_data is enabled
             if (
-                new_max != self.last_max
-                or new_ops != self.last_ops
+                
+                # new_max != self.last_max
+                new_ops != self.last_ops
                 or self.args.debug_data
             ):
                 print_data_sample(
                     dm,
                     new_max,
                     debug_data=self.args.debug_data,
-                    prefix=f"Training Epoch {current_epoch} (max_digits={new_max}, max_ops={new_ops})",
+                    prefix=f"Training Epoch {current_epoch} max_ops={new_ops})",
                 )
-                self.last_max = new_max
+                # self.last_max = new_max
                 self.last_ops = new_ops
 
 
@@ -271,6 +279,7 @@ def main():
         choices=["variable", "padded"],
         help="Defines wheter the numbers should be padded to the same length or not.",
     )
+    parser.add_argument("--data_type", type=str, default="default")
 
     args = parser.parse_args()
 
@@ -293,6 +302,7 @@ def main():
         val_operand_step=args.val_operand_step,
         data_mode=args.data_mode,
         curriculum_operands_start=args.curriculum_operands_start,
+        data_type=args.data_type,
     )
     dm.setup()
 

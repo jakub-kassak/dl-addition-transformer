@@ -240,11 +240,14 @@ class GPTLightningModule(pl.LightningModule):
             r = self.rope(pos, dim)
             rope_all.append(r)
 
-        # rope has dimensions (B, T, head_size//2, 2, 2)
-        # we want to interleave the 2x2 matrixes
-        stacked = torch.stack(rope_all, dim=3)
-        full_rope = stacked.flatten(2, 3)
-        return full_rope.unsqueeze(1)
+        # rope has dimensions (B, T, dims//2, 2, 2)
+        # We simply concatenate them along the feature dimension (dim 2)
+        if all(x.shape == rope_all[0].shape for x in rope_all[1:]):
+            stacked = torch.stack(rope_all, dim=3)
+            full_rope = stacked.flatten(2, 3)
+        else:
+            full_rope = torch.cat(rope_all, dim=2)  # (B, T, head_size//2, 2, 2)
+        return full_rope.unsqueeze(1)  # (B, 1, T, head_size//2, 2, 2)
 
     def forward(
         self, idx, pos1_ids, pos2_ids, pos3_ids, targets=None, return_weights=False
@@ -448,6 +451,93 @@ class GPTLightningModule(pl.LightningModule):
         losses = [v for k, v in metrics.items() if "val_loss/val_" in k]
 
         if seq_accs:
+            # Helper for Weighted Log Mean
+            def calculate_weighted_log_mean(values, weights, epsilon=1e-6):
+                # values: list or tensor of accuracies (0 to 1)
+                # weights: list or tensor of weights
+                v = torch.as_tensor(values, device=self.device, dtype=torch.float32)
+                w = torch.as_tensor(weights, device=self.device, dtype=torch.float32)
+
+                # Metric = exp( sum(w * log(v + eps)) / sum(w) )
+                weighted_log_sum = torch.sum(w * torch.log(v + epsilon))
+                sum_weights = torch.sum(w)
+                return torch.exp(weighted_log_sum / sum_weights)
+
+            # Parse configs to get weights
+            import re
+
+            # Prepare data
+            configs = []
+            valid_seq_vals = []
+            valid_token_vals = []
+
+            # We iterate through the metrics keys to find matching pairs
+            # This relies on the fact that for every 'val_acc_seq/X', there should be 'val_acc_token/X' ideally,
+            # but we can process them independently.
+
+            # Let's gather all configs present in metrics
+            config_map = {}  # name -> {L, N, seq_val, token_val}
+
+            for k, v in metrics.items():
+                if k.startswith("val_acc_seq/val_"):
+                    name = k.replace("val_acc_seq/", "")
+                    match = re.match(r"val_L(\d+)_N(\d+)", name)
+                    if match:
+                        if name not in config_map:
+                            config_map[name] = {}
+                        config_map[name]["L"] = int(match.group(1))
+                        config_map[name]["N"] = int(match.group(2))
+                        config_map[name]["seq"] = v
+
+                if k.startswith("val_acc_token/val_"):
+                    name = k.replace("val_acc_token/", "")
+                    match = re.match(r"val_L(\d+)_N(\d+)", name)
+                    if match:
+                        if name not in config_map:
+                            config_map[name] = {}
+                        config_map[name]["L"] = int(match.group(1))
+                        config_map[name]["N"] = int(match.group(2))
+                        config_map[name]["token"] = v
+
+            # Arrays for computation
+            seq_values = []
+            token_values = []
+            weights_combined = []  # N * L
+            weights_unit = []  # 1
+
+            for name, data in config_map.items():
+                if "seq" in data and "token" in data:
+                    seq_values.append(data["seq"])
+                    token_values.append(data["token"])
+                    L, N = data["L"], data["N"]
+                    weights_combined.append(L * N)
+                    weights_unit.append(1.0)
+
+            if seq_values:
+                # 1. Combined (w = L * N)
+                self.log(
+                    "val_wlm_combined_seq",
+                    calculate_weighted_log_mean(seq_values, weights_combined),
+                    prog_bar=True,
+                )
+                self.log(
+                    "val_wlm_combined_token",
+                    calculate_weighted_log_mean(token_values, weights_combined),
+                    prog_bar=True,
+                )
+
+                # 2. Unweighted (w = 1)
+                self.log(
+                    "val_wlm_unweighted_seq",
+                    calculate_weighted_log_mean(seq_values, weights_unit),
+                    prog_bar=True,
+                )
+                self.log(
+                    "val_wlm_unweighted_token",
+                    calculate_weighted_log_mean(token_values, weights_unit),
+                    prog_bar=True,
+                )
+
             avg_seq_acc = torch.stack(seq_accs).mean()
             self.log("val_avg_seq_acc", avg_seq_acc, prog_bar=True)
             self.log(

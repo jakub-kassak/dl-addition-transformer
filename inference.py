@@ -22,6 +22,55 @@ def encode(arr: list):
 def decode_tokens(tokens: list, itos: dict):
     return list(itos[i] for i in tokens)
 
+def generate_correct_scratchpad(operands, max_len):
+    # Replicate logic from data.py lines 92-110 using torch
+    B = 1
+    device = "cpu"
+
+    # 2. Generate Op Digits with strict padding
+    operands_digits = []
+    for op in operands:
+        # Pad to max_len (zeros at front/MSB)
+        op_padded = op.zfill(max_len)
+        d = [int(c) for c in op_padded]
+        t = torch.tensor(d, dtype=torch.long, device=device).unsqueeze(
+            0
+        )  # (1, max_len)
+        operands_digits.append(t)
+
+    # 3. Compute Partial Sums
+    scratchpad_segments = []
+    current_sum = torch.zeros((B, max_len), dtype=torch.long, device=device)
+    scratchpad_segments.append(current_sum.clone())  # S0 (MSB first, but all zeros)
+
+    for operand in operands_digits:
+        carry = torch.zeros(B, dtype=torch.long, device=device)
+        for i in range(max_len - 1, -1, -1):
+            d_acc = current_sum[:, i]
+            d_op = operand[:, i]
+            total = d_acc + d_op + carry
+            carry = total // 10
+            current_sum[:, i] = total
+
+        scratchpad_segments.append(
+            current_sum.flip(1)
+        )  # Append current sum (LSB first) for S1..Sn
+        current_sum %= 10
+
+    # Construct Token List for String Generation
+    full_tokens = []
+
+    # S0
+    full_tokens.extend(scratchpad_segments[0].squeeze(0).tolist())
+
+    for k in range(1, len(scratchpad_segments)):
+        full_tokens.append(">")
+        full_tokens.extend(scratchpad_segments[k].squeeze(0).tolist())
+
+    full_tokens.append("#")
+
+    return full_tokens
+
 
 def inference(model, operands):
     device = model.device
@@ -73,10 +122,12 @@ def inference(model, operands):
             # Equals
             tokens_list.append(eq_token)
 
+    print("=== Prompt ===")
     print("Tokens: ", encode(decode_tokens(tokens_list, itos)))
     print("P1:     ", encode(p1_list))
     print("P2:     ", encode(p2_list))
     print("P3:     ", encode(p3_list))
+
     x = torch.tensor(tokens_list).unsqueeze(0).to(device)
     pos1 = torch.tensor(p1_list).unsqueeze(0).to(device)
     pos2 = torch.tensor(p2_list).unsqueeze(0).to(device)
@@ -95,10 +146,15 @@ def inference(model, operands):
     print(f"\nTask: {' + '.join(operands)}")
     print(f"Padded Max Length: {max_len}")
 
+
+
     # Run generation
     # model.generate returns (idx, pos1, pos2, pos3)
     # x input shape is (1, T)
     prompt_len = x.shape[1]
+
+    correct_scratchpad = generate_correct_scratchpad(operands, max_len)
+    print(f"Correct Scratchpad:   {encode(correct_scratchpad)}")
 
     # Safety limit for generation
     max_gen = (max_len + 1) * (N + 1) + 10
@@ -116,10 +172,10 @@ def inference(model, operands):
     # Extract generated portion
     # x is (1, T_total)
     generated_ids = x[0, prompt_len:].tolist()
-    generated_tokens = [itos[i] for i in generated_ids]
+    generated_tokens = decode_tokens(generated_ids, itos)
+    generated_tokens_str = encode(generated_tokens)
 
-    full_gen_str = "".join(generated_tokens)
-    print(f"Generated Scratchpad: {full_gen_str}")
+    print(f"Generated Scratchpad: {generated_tokens_str}")
 
     # 3. Final Visualization
     print("\nToken-Position Alignment:")
@@ -139,15 +195,28 @@ def inference(model, operands):
     p2_all = pos2[0].tolist()
     p3_all = pos3[0].tolist()
 
-    for i in range(len(all_tokens)):
-        t_id = all_tokens[i]
-        char = itos[t_id]
-        p1 = p1_all[i]
-        p2 = p2_all[i]
-        p3 = p3_all[i]
+    all_tokens_correct = decode_tokens(all_tokens[:prompt_len], itos) + correct_scratchpad
+    all_tokens_correct_str = encode(all_tokens_correct)
+    all_tokens_str = encode(decode_tokens(all_tokens, itos))
+    p1_all_str = encode(p1_all)
+    p2_all_str = encode(p2_all)
+    p3_all_str = encode(p3_all)
+    print(f"Tokens:  {all_tokens_str}")
+    print(f"Correct: {all_tokens_correct_str}")
+    print(f"P1:      {p1_all_str}")
+    print(f"P2:      {p2_all_str}")
+    print(f"P3:      {p3_all_str}")
 
-        seg = "Input" if p3 == 1 else "Scratch" if p3 == 2 else "Result"
-        print(f"{char:<8} | {p1:<4} | {p2:<4} | {p3:<4} | {seg}")
+    # return
+    # for i in range(len(all_tokens)):
+    #     t_id = all_tokens[i]
+    #     char = itos[t_id]
+    #     p1 = p1_all[i]
+    #     p2 = p2_all[i]
+    #     p3 = p3_all[i]
+
+    #     seg = "Input" if p3 == 1 else "Scratch" if p3 == 2 else "Result"
+    #     print(f"{char:<8} | {p1:<4} | {p2:<4} | {p3:<4} | {seg}")
 
     # 4. Decode Result
     # Result is the LAST partial sum Sn (before #)
@@ -185,7 +254,7 @@ def inference(model, operands):
     correct_val = sum(int(op) for op in operands)
 
     print(f"Final Decoded Sum: {final_val}")
-    print(f"Correct Sum:      {correct_val}")
+    print(f"Correct Sum:       {correct_val}")
 
     if final_val == correct_val:
         print("✅ Correct!")

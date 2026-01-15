@@ -35,19 +35,23 @@ class MultiOperandAdditionDataset(IterableDataset):
         self.random_offsets = random_offsets
         self.data_type = data_type
 
+        # Pad token for batching variable lengths
+        self.pad_token = -1
+
         # Vocab: 0-19 (digits+carry), +, =, >, #
-        self.chars = [str(i) for i in range(20)] + ["+", "=", ">", "#"]
+        self.chars = [str(i) for i in range(20)] + ["+", "=", ">"]
         self.stoi = {ch: i for i, ch in enumerate(self.chars)}
         self.itos = {i: ch for i, ch in enumerate(self.chars)}
-        self.vocab_size = len(self.chars)
+        self.stoi['#'] = self.pad_token
+        self.itos[self.pad_token] = "#"
+        self.vocab_size = len(self.stoi.keys())
 
         self.plus_token = self.stoi["+"]
         self.eq_token = self.stoi["="]
         self.greater_token = self.stoi[">"]
         self.hash_token = self.stoi["#"]
 
-        # Pad token for batching variable lengths
-        self.pad_token = -1
+       
 
     def __iter__(self):
         while True:
@@ -89,7 +93,7 @@ class MultiOperandAdditionDataset(IterableDataset):
 
         # 1. Determine max_len (padding everything to this length)
         # Allowance for carry: log10(max_operands)
-        carry_allowance = math.ceil(math.log10(self.max_operands))
+        carry_allowance = math.ceil(math.log10(N_Ops))
         max_len = self.max_digits + carry_allowance
 
         ## split batch into chunks where digits will vary
@@ -104,13 +108,18 @@ class MultiOperandAdditionDataset(IterableDataset):
             idx = 0
             for i, size in enumerate(chunk_sizes):
                 n_dig = self.min_digits + i
-                
+        
                 d = torch.randint(0, 10, (size, n_dig))
 
                 # Pad to max_len with zeros (at the front/MSB for input)
-                padding = torch.zeros((size, max_len - n_dig), dtype=torch.long)
-                full_d = torch.cat([padding, d], dim=1)
-                batch[idx : idx + size] = full_d
+                carry_allowance = math.ceil(math.log10(N_Ops))
+                max_len_ndig = n_dig + carry_allowance
+                padding_zeros = torch.zeros((size, max_len_ndig - n_dig), dtype=torch.long)
+                full_d = torch.cat([padding_zeros, d], dim=1)
+                padding_pound = torch.full((size,max_len-max_len_ndig), -1)
+                full_final = torch.cat([full_d, padding_pound], dim=1)
+
+                batch[idx : idx + size] = full_final
                 idx += size
             operand_digits.append(batch)
 
@@ -128,22 +137,42 @@ class MultiOperandAdditionDataset(IterableDataset):
             operands_digits, max_len = self.generate_varied_digits_per_operand(N_Ops)
         
 
+
         # 3. Compute Partial Sums (S0=0, S1=N1, ..., SN=Sum(N1..NN))
         # Each Si is stored LSB-first in scratchpad_segments (length max_len)
         scratchpad_segments = []
         current_sum = torch.zeros((B, max_len), dtype=torch.long)
-        scratchpad_segments.append(current_sum.clone())
+        ex = operands_digits[0] 
+        cond = ex !=-1
+        scratchpad_segments.append(torch.where(cond,torch.zeros_like(ex), ex ))
        
         for operand in operands_digits:
             carry = torch.zeros(B, dtype=torch.long)
             for i in range(max_len - 1, -1, -1):
                 d_acc = current_sum[:, i]
                 d_op = operand[:, i]
-
-                total = d_acc + d_op + carry
-                carry = total // 10
+                # d_op = torch.where(d_op == -1, torch.zeros_like(d_op), d_op)
+                # print(d_acc)
+                # Only sum values where d_op is not -1; else, keep as -1
+                # If either d_op or d_acc is -1, keep as -1, else add
+                cond = (d_op == -1) | (d_acc == -1) 
+                # print (cond)
+                total = torch.where(cond, torch.full_like(d_op, -1), d_acc + d_op + carry)
+                
                 current_sum[:, i] = total
-            scratchpad_segments.append(current_sum.flip(1))
+                # everywhere there is -1, make it 0 in total
+                total = torch.where(total == -1, torch.zeros_like(total), total)
+                carry = total // 10
+                # 
+            flipped = current_sum.clone()
+            for row_idx, row in enumerate(current_sum):
+                mask = row != -1
+                values = row[mask]
+                flipped_row = row.clone()
+                flipped_row[mask] = values.flip(0)
+                flipped[row_idx] = flipped_row
+            scratchpad_segments.append(flipped)
+            # print(current_sum)
             current_sum %= 10
         # print(scratchpad_segments)
 

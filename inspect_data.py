@@ -6,9 +6,9 @@ import argparse
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--min_digits", type=int, default=1)
-    parser.add_argument("--max_digits", type=int, default=7)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--n_samples", type=int, default=3)
+    parser.add_argument("--max_digits", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=5)
+    parser.add_argument("--n_samples", type=int, default=5)
     parser.add_argument("--min_operands", type=int, default=2)
     parser.add_argument("--max_operands", type=int, default=3)
     parser.add_argument("--max_val_operands", type=int, default=5)
@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--val_step", type=int, default=3)
     parser.add_argument("--data_mode", type=str, default="variable")
     parser.add_argument("--random_offsets", type=bool, default=False)
+    parser.add_argument("--data_type", type=str, default="digit_combinations")
     args = parser.parse_args()
 
     print(
@@ -32,6 +33,7 @@ def main():
         max_operands=args.max_operands,
         data_mode=args.data_mode,
         random_offsets=args.random_offsets,  # Explicitly enable for inspection
+        data_type=args.data_type,
     )
     dm.setup()
 
@@ -51,6 +53,7 @@ def main():
     itos = dm.itos
 
     def decode(indices):
+        # print(indices)
         return   " ".join([f'{itos[i.item()]:>2}' for i in indices])
 
     print(f"\nBatch Shapes:")
@@ -73,9 +76,9 @@ def main():
 
         print(f"y (Target):  {seq_y}")
         print(f"x  (Input):  {seq_x}")
-        print(f"p1 (Block):  {" ".join(f'{p:>2}' for p in p1[i].tolist())}")
-        print(f"p2 (Digit):  {" ".join(f'{p:>2}' for p in p2[i].tolist())}")
-        print(f"p3  (Type):  {" ".join(f'{p:>2}' for p in p3[i].tolist())}")
+        print(f"p1 (Block):  {' '.join(f'{p:>2}' for p in p1[i].tolist())}")
+        print(f"p2 (Digit):  {' '.join(f'{p:>2}' for p in p2[i].tolist())}")
+        print(f"p3  (Type):  {' '.join(f'{p:>2}' for p in p3[i].tolist())}")
 
         # Positional Encodings
         tokens_x = [itos[idx.item()] for idx in x[i]]
@@ -83,7 +86,7 @@ def main():
         pos2_vals = p2[i].tolist()
         pos3_vals = p3[i].tolist()
 
-        if False:
+        if True:
             print("-" * 80)
             print(
                 f"{'Token':<6} | {'Pos1 (Block)':<12} | {'Pos2 (Digit+Offset)':<20} | {'Pos3 (Type)':<12}"

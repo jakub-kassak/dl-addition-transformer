@@ -12,9 +12,11 @@ from pytorch_lightning.loggers import TensorBoardLogger
 import argparse
 from rich.console import Console
 from rich.table import Table
+import random
 
 from model import GPTLightningModule
 from data import AdditionDataModule
+
 
 
 class ValidationTableCallback(Callback):
@@ -79,12 +81,12 @@ class ValidationTableCallback(Callback):
             print(md_table)
 
 
-def print_data_sample(dm, max_digits, debug_data=False, prefix=""):
+def print_data_sample(dm, debug_data=False, prefix=""):
     from data import MultiOperandAdditionDataset
 
     temp_ds = MultiOperandAdditionDataset(
         dm.hparams.min_train_digits,
-        max_digits,
+        dm.hparams.max_train_digits,
         batch_size=1,
         offset_range=100,
         random_offsets=dm.hparams.random_offsets,
@@ -112,18 +114,21 @@ def print_data_sample(dm, max_digits, debug_data=False, prefix=""):
 
     # Simple decode for debugging raw tokens
     decode_raw = lambda l: "".join([f"[{dm.itos[i.item()]}]" for i in l])
-    print(f"Sample Input (mod 10): {decode_and_mod(x[0])}")
-    print(f"Sample Input (raw):    {decode_raw(x[0])}")
+    # INSERT_YOUR_CODE
+    batch_size = x.shape[0]
+    rand_idx = random.randint(0, batch_size - 1)
+    print(f"Sample Input (mod 10): {decode_and_mod(x[rand_idx])}")
+    print(f"Sample Input (raw):    {decode_raw(x[rand_idx])}")
 
     if debug_data:
-        print(f"Sample Pos1:           {p1[0].tolist()}")
-        print(f"Sample Pos2:           {p2[0].tolist()}")
-        print(f"Sample Pos3:           {p3[0].tolist()}")
+        print(f"Sample Pos1:           {p1[rand_idx].tolist()}")
+        print(f"Sample Pos2:           {p2[rand_idx].tolist()}")
+        print(f"Sample Pos3:           {p3[rand_idx].tolist()}")
         print("\nDetailed Token-Position alignment:")
-        tokens_str = [f"{dm.itos[i.item()]}" for i in x[0]]
-        p1_str = [str(p.item()) for p in p1[0]]
-        p2_str = [str(p.item()) for p in p2[0]]
-        p3_str = [str(p.item()) for p in p3[0]]
+        tokens_str = [f"{dm.itos[i.item()]}" for i in x[rand_idx]]
+        p1_str = [str(p.item()) for p in p1[rand_idx]]
+        p2_str = [str(p.item()) for p in p2[rand_idx]]
+        p3_str = [str(p.item()) for p in p3[rand_idx]]
 
         # Simple alignment
         for t, p1_v, p2_v, p3_v in zip(tokens_str, p1_str, p2_str, p3_str):
@@ -132,69 +137,69 @@ def print_data_sample(dm, max_digits, debug_data=False, prefix=""):
     print("---------------------------\n")
 
 
-class CurriculumLoggerCallback(Callback):
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        self.last_max = -1
-        self.last_ops = -1
+# class CurriculumLoggerCallback(Callback):
+#     def __init__(self, args):
+#         super().__init__()
+#         self.args = args
+#         self.last_max = -1
+#         self.last_ops = -1
 
-    def on_train_epoch_start(self, trainer, pl_module):
-        dm = trainer.datamodule
-        if hasattr(dm, "train_ds"):
-            # Update Curriculum
-            current_epoch = trainer.current_epoch
-            if dm.hparams.data_type == "default":
-                new_max = min(
-                    dm.hparams.curriculum_start + current_epoch, dm.hparams.max_train_digits
-                )
-                dm.train_ds.max_digits = new_max
+#     def on_train_epoch_start(self, trainer, pl_module):
+#         dm = trainer.datamodule
+#         if hasattr(dm, "train_ds"):
+#             # Update Curriculum
+#             current_epoch = trainer.current_epoch
+#             if dm.hparams.data_type == "default":
+#                 new_max = min(
+#                     dm.hparams.curriculum_start + current_epoch, dm.hparams.max_train_digits
+#                 )
+#                 dm.train_ds.max_digits = new_max
 
-                pl_module.log(
-                    "curriculum/max_digits",
-                    float(new_max),
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=True,
-                )
-            elif dm.hparams.data_type == "digit_combinations":
-                new_max = dm.train_ds.max_digits
+#                 pl_module.log(
+#                     "curriculum/max_digits",
+#                     float(new_max),
+#                     on_step=False,
+#                     on_epoch=True,
+#                     prog_bar=True,
+#                 )
+#             elif dm.hparams.data_type == "digit_combinations":
+#                 new_max = dm.train_ds.max_digits
 
-            # Update Operands Curriculum
-            if dm.hparams.curriculum_operands_start is not None:
-                new_ops = min(
-                    dm.hparams.curriculum_operands_start + current_epoch,
-                    dm.hparams.max_operands,
-                )
-                dm.train_ds.max_operands = new_ops
-                pl_module.log(
-                    "curriculum/max_operands",
-                    float(new_ops),
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=True,
-                )
-            else:
-                new_ops = dm.train_ds.max_operands
+#             # Update Operands Curriculum
+#             if dm.hparams.curriculum_operands_start is not None:
+#                 new_ops = min(
+#                     dm.hparams.curriculum_operands_start + current_epoch,
+#                     dm.hparams.max_operands,
+#                 )
+#                 dm.train_ds.max_operands = new_ops
+#                 pl_module.log(
+#                     "curriculum/max_operands",
+#                     float(new_ops),
+#                     on_step=False,
+#                     on_epoch=True,
+#                     prog_bar=True,
+#                 )
+#             else:
+#                 new_ops = dm.train_ds.max_operands
             
-            with open("logs/log.txt", "a") as f:
-                f.write(f"UPDATE: max-ops {new_ops}")
+#             with open("logs/log.txt", "a") as f:
+#                 f.write(f"UPDATE: max-ops {new_ops}")
 
-            # Print sample if curriculum advanced OR if debug_data is enabled
-            if (
+#             # Print sample if curriculum advanced OR if debug_data is enabled
+#             if (
                 
-                # new_max != self.last_max
-                new_ops != self.last_ops
-                or self.args.debug_data
-            ):
-                print_data_sample(
-                    dm,
-                    new_max,
-                    debug_data=self.args.debug_data,
-                    prefix=f"Training Epoch {current_epoch} max_ops={new_ops})",
-                )
-                # self.last_max = new_max
-                self.last_ops = new_ops
+#                 # new_max != self.last_max
+#                 new_ops != self.last_ops
+#                 or self.args.debug_data
+#             ):
+#                 print_data_sample(
+#                     dm,
+#                     new_max,
+#                     debug_data=self.args.debug_data,
+#                     prefix=f"Training Epoch {current_epoch} max_ops={new_ops})",
+#                 )
+#                 # self.last_max = new_max
+#                 self.last_ops = new_ops
 
 
 def main():
@@ -241,8 +246,7 @@ def main():
         default=1000,
         help="Define length of one curriculum epoch.",
     )
-    parser.add_argument("--curriculum_start", type=int, default=3)
-    parser.add_argument("--curriculum_operands_start", type=int, default=None)
+
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--n_embd", type=int, default=256)
@@ -293,7 +297,6 @@ def main():
         val_step=args.val_step,
         batch_size=args.batch_size,
         val_batch_size=args.val_batch_size,
-        curriculum_start=args.curriculum_start,
         num_workers=0 if args.smoke_test else args.num_workers,
         random_offsets=args.random_offsets,
         min_operands=args.min_operands,
@@ -301,7 +304,6 @@ def main():
         max_val_operands=args.max_val_operands,
         val_operand_step=args.val_operand_step,
         data_mode=args.data_mode,
-        curriculum_operands_start=args.curriculum_operands_start,
         data_type=args.data_type,
     )
     dm.setup()
@@ -352,7 +354,7 @@ def main():
             checkpoint_callback,
             lr_monitor,
             ValidationTableCallback(),
-            CurriculumLoggerCallback(args),
+            # CurriculumLoggerCallback(args),
         ],
         "accelerator": "auto",
         "devices": 1,
@@ -382,7 +384,6 @@ def main():
         # Initial debug print
         print_data_sample(
             dm,
-            min(dm.hparams.curriculum_start, dm.hparams.max_train_digits),
             debug_data=args.debug_data,
             prefix=f"Initial State Experiment: {args.exp_name}",
         )

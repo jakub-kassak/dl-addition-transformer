@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --time=01:00
+#SBATCH --time=01:00:00
 #SBATCH --account=deep_learning
-#SBATCH --output=slurm_logs/mixed_pe_11M_%j.out
-#SBATCH --error=slurm_logs/mixed_pe_11M_%j.err
+#SBATCH --output=slurm_logs/MO%j.out
+#SBATCH --error=slurm_logs/MO%j.err
 
 set -euo pipefail
 export PYTHONUNBUFFERED=1
@@ -25,12 +25,10 @@ which python
 echo "============================"
 
 python train.py \
-  --exp_name "mixed_pe_11M_4ops_4digits_06_digit_comb" \
+  --exp_name "MO" \
   --n_embd 384 --n_head 4 --n_layer 6 \
   --min_operands 2 --max_operands 5 \
   --min_train_digits 1 --max_train_digits 5 \
-  --curriculum_start 1 \
-  --curriculum_operands_start 2 \
   --data_mode padded \
   --data_type digit_combinations \
   --pos_emb_type mixed \

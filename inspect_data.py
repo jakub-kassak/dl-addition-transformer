@@ -28,7 +28,6 @@ def main():
         min_train_digits=args.min_digits,
         max_train_digits=args.max_digits,
         batch_size=args.batch_size,
-        curriculum_start=args.max_digits,
         min_operands=args.min_operands,
         max_operands=args.max_operands,
         data_mode=args.data_mode,

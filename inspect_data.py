@@ -51,7 +51,7 @@ def main():
     itos = dm.itos
 
     def decode(indices):
-        return   " ".join([f'{itos[i.item()]:>2}' for i in indices])
+        return " ".join([f"{itos[i.item()]:>2}" for i in indices])
 
     print(f"\nBatch Shapes:")
     print(f"x: {x.shape}")
@@ -73,9 +73,9 @@ def main():
 
         print(f"y (Target):  {seq_y}")
         print(f"x  (Input):  {seq_x}")
-        print(f"p1 (Block):  {" ".join(f'{p:>2}' for p in p1[i].tolist())}")
-        print(f"p2 (Digit):  {" ".join(f'{p:>2}' for p in p2[i].tolist())}")
-        print(f"p3  (Type):  {" ".join(f'{p:>2}' for p in p3[i].tolist())}")
+        print(f"p1 (Block):  {' '.join(f'{p:>2}' for p in p1[i].tolist())}")
+        print(f"p2 (Digit):  {' '.join(f'{p:>2}' for p in p2[i].tolist())}")
+        print(f"p3  (Type):  {' '.join(f'{p:>2}' for p in p3[i].tolist())}")
 
         # Positional Encodings
         tokens_x = [itos[idx.item()] for idx in x[i]]
@@ -92,7 +92,9 @@ def main():
 
             for t, p1_v, p2_v, p3_v in zip(tokens_x, pos1_vals, pos2_vals, pos3_vals):
                 # map p3 to description
-                type_desc = "Input" if p3_v == 1 else "Scratch" if p3_v == 2 else "Result"
+                type_desc = (
+                    "Input" if p3_v == 1 else "Scratch" if p3_v == 2 else "Result"
+                )
                 print(f"{t:<6} | {p1_v:<12} | {p2_v:<20} | {p3_v:<4} ({type_desc})")
 
     print("\n✅ Inspection Complete")

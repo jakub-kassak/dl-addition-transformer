@@ -137,15 +137,17 @@ def print_data_sample(dm, debug_data=False, prefix=""):
     print("---------------------------\n")
 
 
-# class CurriculumLoggerCallback(Callback):
-#     def __init__(self, args):
-#         super().__init__()
-#         self.args = args
-#         self.last_max = -1
-#         self.last_ops = -1
+class CurriculumLoggerCallback(Callback):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.last_max = -1
+        self.last_ops = -1
 
-#     def on_train_epoch_start(self, trainer, pl_module):
-#         dm = trainer.datamodule
+    def on_train_epoch_start(self, trainer, pl_module):
+        
+        dm = trainer.datamodule
+        print_data_sample(dm)
 #         if hasattr(dm, "train_ds"):
 #             # Update Curriculum
 #             current_epoch = trainer.current_epoch

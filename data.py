@@ -42,6 +42,7 @@ class MultiOperandAdditionDataset(IterableDataset):
         self.chars = [str(i) for i in range(20)] + ["+", "=", ">"]
         self.stoi = {ch: i for i, ch in enumerate(self.chars)}
         self.itos = {i: ch for i, ch in enumerate(self.chars)}
+        self.chars.append("#")
         self.stoi['#'] = self.pad_token
         self.itos[self.pad_token] = "#"
         self.vocab_size = len(self.stoi.keys())

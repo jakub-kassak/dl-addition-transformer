@@ -264,7 +264,6 @@ class AdditionDataModule(pl.LightningDataModule):
         val_step=3,
         batch_size=64,
         num_workers=0,
-        curriculum_start=3,
         val_batch_size=None,
         random_offsets=True,
         min_operands=2,
@@ -272,7 +271,6 @@ class AdditionDataModule(pl.LightningDataModule):
         max_val_operands=10,
         val_operand_step=2,
         data_mode="variable",
-        curriculum_operands_start=None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -290,16 +288,6 @@ class AdditionDataModule(pl.LightningDataModule):
             random_offsets=self.hparams.random_offsets,
         )
 
-        # Normalize curriculum start immediately
-        # This ensures setup() results are consistent regardless of max_train_digits
-        initial_max = min(self.hparams.curriculum_start, self.hparams.max_train_digits)
-        self.train_ds.max_digits = initial_max
-
-        if self.hparams.curriculum_operands_start is not None:
-            initial_ops = min(
-                self.hparams.curriculum_operands_start, self.hparams.max_operands
-            )
-            self.train_ds.max_operands = initial_ops
         self.stoi = self.train_ds.stoi
         self.itos = self.train_ds.itos
         self.vocab_size = self.train_ds.vocab_size

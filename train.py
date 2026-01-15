@@ -79,12 +79,12 @@ class ValidationTableCallback(Callback):
             print(md_table)
 
 
-def print_data_sample(dm, max_digits, debug_data=False, prefix=""):
+def print_data_sample(dm, debug_data=False, prefix=""):
     from data import MultiOperandAdditionDataset
 
     temp_ds = MultiOperandAdditionDataset(
         dm.hparams.min_train_digits,
-        max_digits,
+        dm.hparams.max_train_digits,
         batch_size=1,
         offset_range=100,
         random_offsets=dm.hparams.random_offsets,
@@ -141,52 +141,13 @@ class CurriculumLoggerCallback(Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         dm = trainer.datamodule
         if hasattr(dm, "train_ds"):
-            # Update Curriculum
-            current_epoch = trainer.current_epoch
-            new_max = min(
-                dm.hparams.curriculum_start + current_epoch, dm.hparams.max_train_digits
-            )
-            dm.train_ds.max_digits = new_max
 
-            pl_module.log(
-                "curriculum/max_digits",
-                float(new_max),
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
+            print_data_sample(
+                dm,
+                debug_data=self.args.debug_data,
+                prefix=f"Training Epoch {trainer.current_epoch})",
             )
 
-            # Update Operands Curriculum
-            if dm.hparams.curriculum_operands_start is not None:
-                new_ops = min(
-                    dm.hparams.curriculum_operands_start + current_epoch,
-                    dm.hparams.max_operands,
-                )
-                dm.train_ds.max_operands = new_ops
-                pl_module.log(
-                    "curriculum/max_operands",
-                    float(new_ops),
-                    on_step=False,
-                    on_epoch=True,
-                    prog_bar=True,
-                )
-            else:
-                new_ops = dm.train_ds.max_operands
-
-            # Print sample if curriculum advanced OR if debug_data is enabled
-            if (
-                new_max != self.last_max
-                or new_ops != self.last_ops
-                or self.args.debug_data
-            ):
-                print_data_sample(
-                    dm,
-                    new_max,
-                    debug_data=self.args.debug_data,
-                    prefix=f"Training Epoch {current_epoch} (max_digits={new_max}, max_ops={new_ops})",
-                )
-                self.last_max = new_max
-                self.last_ops = new_ops
 
 
 def main():
@@ -233,8 +194,6 @@ def main():
         default=1000,
         help="Define length of one curriculum epoch.",
     )
-    parser.add_argument("--curriculum_start", type=int, default=3)
-    parser.add_argument("--curriculum_operands_start", type=int, default=None)
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--n_embd", type=int, default=256)
@@ -284,7 +243,6 @@ def main():
         val_step=args.val_step,
         batch_size=args.batch_size,
         val_batch_size=args.val_batch_size,
-        curriculum_start=args.curriculum_start,
         num_workers=0 if args.smoke_test else args.num_workers,
         random_offsets=args.random_offsets,
         min_operands=args.min_operands,
@@ -292,7 +250,6 @@ def main():
         max_val_operands=args.max_val_operands,
         val_operand_step=args.val_operand_step,
         data_mode=args.data_mode,
-        curriculum_operands_start=args.curriculum_operands_start,
     )
     dm.setup()
 
@@ -372,7 +329,6 @@ def main():
         # Initial debug print
         print_data_sample(
             dm,
-            min(dm.hparams.curriculum_start, dm.hparams.max_train_digits),
             debug_data=args.debug_data,
             prefix=f"Initial State Experiment: {args.exp_name}",
         )

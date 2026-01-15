@@ -27,7 +27,6 @@ def main():
         min_train_digits=args.min_digits,
         max_train_digits=args.max_digits,
         batch_size=args.batch_size,
-        curriculum_start=args.max_digits,
         min_operands=args.min_operands,
         max_operands=args.max_operands,
         data_mode=args.data_mode,
@@ -73,9 +72,9 @@ def main():
 
         print(f"y (Target):  {seq_y}")
         print(f"x  (Input):  {seq_x}")
-        print(f"p1 (Block):  {" ".join(f'{p:>2}' for p in p1[i].tolist())}")
-        print(f"p2 (Digit):  {" ".join(f'{p:>2}' for p in p2[i].tolist())}")
-        print(f"p3  (Type):  {" ".join(f'{p:>2}' for p in p3[i].tolist())}")
+        print(f"p1 (Block):  {' '.join(f'{p:>2}' for p in p1[i].tolist())}")
+        print(f"p2 (Digit):  {' '.join(f'{p:>2}' for p in p2[i].tolist())}")
+        print(f"p3  (Type):  {' '.join(f'{p:>2}' for p in p3[i].tolist())}")
 
         # Positional Encodings
         tokens_x = [itos[idx.item()] for idx in x[i]]

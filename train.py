@@ -233,7 +233,7 @@ def main():
         default=1000,
         help="Define length of one curriculum epoch.",
     )
-    parser.add_argument("--curriculum_start", type=int, default=3)
+    parser.add_argument("--curriculum_start", type=int, default=None)
     parser.add_argument("--curriculum_operands_start", type=int, default=None)
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
@@ -273,6 +273,8 @@ def main():
     )
 
     args = parser.parse_args()
+    args.curriculum_start = args.curriculum_start if args.curriculum_start is not None else args.max_train_digits
+    args.curriculum_operands_start = args.curriculum_operands_start if args.curriculum_operands_start is not None else args.max_operands
 
     pl.seed_everything(args.seed)
 

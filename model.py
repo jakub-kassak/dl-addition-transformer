@@ -240,10 +240,10 @@ class GPTLightningModule(pl.LightningModule):
             r = self.rope(pos, dim)
             rope_all.append(r)
 
-        # Concatenate along the dim//2 axis (dim -3 in return of rope: B, T, head_size//2, 2, 2)
-        # Actually in prepare_rope we want to return shape (B, 1, T, total_head_size//2, 2, 2)
-
-        full_rope = torch.cat(rope_all, dim=-3)
+        # rope has dimensions (B, T, head_size//2, 2, 2)
+        # we want to interleave the 2x2 matrixes
+        stacked = torch.stack(rope_all, dim=3)
+        full_rope = stacked.flatten(2, 3)
         return full_rope.unsqueeze(1)
 
     def forward(

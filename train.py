@@ -8,7 +8,8 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
+import wandb
 import argparse
 from rich.console import Console
 from rich.table import Table
@@ -20,63 +21,115 @@ from data import AdditionDataModule
 class ValidationTableCallback(Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         console = Console()
-        table = Table(title=f"Validation Results (Epoch {trainer.current_epoch})")
-
-        table.add_column("Dataset", justify="left", style="cyan", no_wrap=True)
-        table.add_column("Token Acc", justify="right", style="green")
-        table.add_column("Seq Accuracy", justify="right", style="magenta")
-        table.add_column("Loss", justify="right", style="red")
-
-        # Markdown table construction
-        md_table = "| Dataset | Token Acc | Seq Accuracy | Loss |\n"
-        md_table += "|:---|---:|---:|---:|\n"
 
         # Get validation names from datamodule
         val_names = getattr(trainer.datamodule, "val_config_names", [])
         if not val_names:
-            # Fallback if names not found or using old logic
             val_names = getattr(trainer.datamodule, "val_names", [])
             if not val_names:
                 return
 
         metrics = trainer.callback_metrics
 
+        # Parse names: val_L{L}_N{N}
+        import re
+
+        parsed_configs = []
         for name in val_names:
-            # New format: val_acc_token/val_L1_N2
+            match = re.match(r"val_L(\d+)_N(\d+)", name)
+            if match:
+                L, N = int(match.group(1)), int(match.group(2))
+                parsed_configs.append({"name": name, "L": L, "N": N})
 
-            def get_m(key_base):
-                # Try specific name (Sequential logic)
-                val = metrics.get(f"{key_base}/{name}")
-                # Fallback to old dataloader_idx logic if name lookup fails (backward compact)
-                if val is None:
-                    # This fallback is tricky without index, but we assume new logic prevails
-                    pass
-                return val
+        if not parsed_configs:
+            return
 
-            token_acc = get_m("val_acc_token")
-            seq_acc = get_m("val_acc_seq")
-            loss = get_m("val_loss")
+        unique_ls = sorted(list(set(c["L"] for c in parsed_configs)))
+        unique_ns = sorted(list(set(c["N"] for c in parsed_configs)))
 
-            if token_acc is not None:
-                token_acc_val = f"{token_acc:.4f}"
-                seq_acc_val = f"{seq_acc:.4f}" if seq_acc is not None else "N/A"
-                loss_val = f"{loss:.4f}" if loss is not None else "N/A"
+        # Define styles for formatting
+        styles = {"val_acc_token": "green", "val_acc_seq": "magenta", "val_loss": "red"}
 
-                table.add_row(name, token_acc_val, seq_acc_val, loss_val)
-                md_table += (
-                    f"| {name} | {token_acc_val} | {seq_acc_val} | {loss_val} |\n"
+        def create_grid_table(title, metric_key):
+            table = Table(title=title)
+            table.add_column("Digits \\ Ops", justify="left", style="cyan")
+            for N in unique_ns:
+                table.add_column(
+                    f"N={N}", justify="right", style=styles.get(metric_key, "")
                 )
 
-        console.print(table)
-
-        # Log to TensorBoard
-        if hasattr(trainer.logger, "experiment") and hasattr(
-            trainer.logger.experiment, "add_text"
-        ):
-            trainer.logger.experiment.add_text(
-                "validation_table", md_table, global_step=trainer.global_step
+            # Markdown table construction
+            md = f"### {title}\n\n"
+            md += (
+                "| Digits \\ Ops | "
+                + " | ".join([f"N={N}" for N in unique_ns])
+                + " |\n"
             )
-            print(md_table)
+            md += "|:---|" + "|".join(["---:"] * len(unique_ns)) + "|\n"
+
+            for L in unique_ls:
+                row_vals = [f"L={L}"]
+                md_row = [f"L={L}"]
+                for N in unique_ns:
+                    # Find matching name
+                    config_name = next(
+                        (
+                            c["name"]
+                            for c in parsed_configs
+                            if c["L"] == L and c["N"] == N
+                        ),
+                        None,
+                    )
+                    val = None
+                    if config_name:
+                        val = metrics.get(f"{metric_key}/{config_name}")
+
+                    if val is not None:
+                        val_str = f"{val:.4f}"
+                    else:
+                        val_str = "-"
+                    row_vals.append(val_str)
+                    md_row.append(val_str)
+                table.add_row(*row_vals)
+                md += "| " + " | ".join(md_row) + " |\n"
+
+            return table, md
+
+        # Create the three tables
+        t_token, md_token = create_grid_table(
+            f"Token Accuracy (Epoch {trainer.current_epoch})", "val_acc_token"
+        )
+        t_seq, md_seq = create_grid_table(
+            f"Sequence Accuracy (Epoch {trainer.current_epoch})", "val_acc_seq"
+        )
+        t_loss, md_loss = create_grid_table(
+            f"Loss (Epoch {trainer.current_epoch})", "val_loss"
+        )
+
+        full_md = md_token + "\n" + md_seq + "\n" + md_loss
+
+        # Print to console
+        console.print(t_token)
+        console.print(t_seq)
+        console.print(t_loss)
+
+        # Log to loggers
+        if trainer.loggers:
+            for logger in trainer.loggers:
+                if isinstance(logger, TensorBoardLogger):
+                    logger.experiment.add_text(
+                        "validation_tables", full_md, global_step=trainer.global_step
+                    )
+                elif isinstance(logger, WandbLogger):
+                    # Log as markdown in WandB
+                    logger.experiment.log(
+                        {
+                            "validation_tables": wandb.Html(
+                                f"<pre style='font-family: \"Courier New\", Courier, monospace; line-height: 1.2;'>{full_md}</pre>"
+                            )
+                        },
+                        step=trainer.global_step,
+                    )
 
 
 def print_data_sample(dm, max_digits, debug_data=False, prefix=""):
@@ -271,10 +324,30 @@ def main():
         choices=["variable", "padded"],
         help="Defines wheter the numbers should be padded to the same length or not.",
     )
+    parser.add_argument(
+        "--use_wandb", action="store_true", help="Enable WandB logging."
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="addition-transformer",
+        help="WandB project name.",
+    )
+    parser.add_argument(
+        "--wandb_entity", type=str, default=None, help="WandB entity/username."
+    )
 
     args = parser.parse_args()
-    args.curriculum_start = args.curriculum_start if args.curriculum_start is not None else args.max_train_digits
-    args.curriculum_operands_start = args.curriculum_operands_start if args.curriculum_operands_start is not None else args.max_operands
+    args.curriculum_start = (
+        args.curriculum_start
+        if args.curriculum_start is not None
+        else args.max_train_digits
+    )
+    args.curriculum_operands_start = (
+        args.curriculum_operands_start
+        if args.curriculum_operands_start is not None
+        else args.max_operands
+    )
 
     pl.seed_everything(args.seed)
 
@@ -349,9 +422,22 @@ def main():
         "accelerator": "auto",
         "devices": 1,
         "gradient_clip_val": args.grad_clip,
-        "logger": TensorBoardLogger("logs", name=args.exp_name),
+        "logger": [],
         # "compile": True,
     }
+
+    # Setup Loggers
+    loggers = [TensorBoardLogger("logs", name=args.exp_name)]
+    if args.use_wandb:
+        loggers.append(
+            WandbLogger(
+                project=args.wandb_project,
+                name=args.exp_name,
+                entity=args.wandb_entity,
+                config=args,
+            )
+        )
+    trainer_kwargs["logger"] = loggers
 
     trainer = pl.Trainer(**trainer_kwargs)
     trainer.compile_model = True

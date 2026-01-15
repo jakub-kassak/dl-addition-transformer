@@ -16,103 +16,160 @@ class AttentionExplorer:
 
         # Token mapping based on data.py
         # Token mapping based on data.py (22 tokens: 0-19, +, =)
-        self.chars = [str(i) for i in range(20)] + ["+", "="]
+        # Token mapping based on data.py (22 tokens: 0-19, +, =, >, #)
+        self.chars = [str(i) for i in range(20)] + ["+", "=", ">", "#"]
         self.stoi = {ch: i for i, ch in enumerate(self.chars)}
         self.itos = {i: ch for i, ch in enumerate(self.chars)}
         self.pad_token = -1
         self.plus_token = self.stoi["+"]
         self.eq_token = self.stoi["="]
+        self.greater_token = self.stoi[">"]
+        self.hash_token = self.stoi["#"]
 
     def encode_equation(self, equation_string):
         """
-        Encodes an equation string into tokens and positional IDs.
-        Matches the logic in data.py
+        Encodes an equation string into tokens and positional IDs (P1, P2, P3).
+        Mimics data.py generate_batch logic for specific operands.
         """
-        if "=" not in equation_string:
-            raise ValueError("Equation must contain '='")
+        # Parse operands from equation string
+        if "=" in equation_string:
+            lhs, _ = equation_string.split("=")  # Ignore RHS, we calculate it
+        else:
+            lhs = equation_string
 
-        prefix, result_str = equation_string.split("=")
-        if "+" not in prefix:
-            raise ValueError("Prefix must contain '+'")
+        operands = lhs.split("+")
+        N_Ops = len(operands)
 
-        n1_str, n2_str = prefix.split("+")
-        L = len(n1_str)
-        if len(n2_str) != L:
-            # We handle same-length additions primarily as per data.py
-            # If they differ, we'd need to know how the user pads them.
-            # Assuming they are same length for now.
-            pass
+        # Determine max_digits and length
+        max_digits = max(len(op) for op in operands)
+        carry_allowance = 1  # math.ceil(math.log10(N_Ops)) if N_Ops > 1 else 0 # Simplified for visualizer
+        if N_Ops > 1:
+            import math
 
-        n1_tokens = [self.stoi[c] for c in n1_str]
-        n2_tokens = [self.stoi[c] for c in n2_str]
+            carry_allowance = math.ceil(math.log10(N_Ops))
 
-        # Calculate Carries for result tokens (matches data.py logic)
-        res_tokens = []
-        carry = 0
-        # Result digits are LSB first in the sequence as per data.py
-        # We need to calculate carries from LSB to MSB
-        n1_digits = [int(c) for c in n1_str]
-        n2_digits = [int(c) for c in n2_str]
+        max_len = max_digits + carry_allowance
 
-        for d1, d2 in zip(reversed(n1_digits), reversed(n2_digits)):
-            total = d1 + d2 + carry
-            res_tokens.append(self.stoi[str(total)])
-            carry = total // 10
+        B = 1
 
-        # Append final carry
-        res_tokens.append(self.stoi[str(carry)])
+        # 2. Generate Op Digits with strict padding
+        operands_digits = []
+        for op in operands:
+            # Pad to max_len (zeros at front/MSB)
+            op_padded = op.zfill(max_len)
+            d = [int(c) for c in op_padded]
+            t = torch.tensor(d, dtype=torch.long).unsqueeze(0)  # (1, max_len)
+            operands_digits.append(t)
 
-        # The equation provided by the user in --equation might be incomplete or have the wrong result.
-        # We use the CALCULATED result tokens for the forward pass to match training data distribution.
+        # 3. Compute Partial Sums
+        scratchpad_segments = []
+        current_sum = torch.zeros((B, max_len), dtype=torch.long)
+        scratchpad_segments.append(current_sum.clone())  # S0
 
-        # tokens = [n1] + [+] + [n2] + [=] + [s] + [0]
-        tokens = (
-            n1_tokens + [self.plus_token] + n2_tokens + [self.eq_token] + res_tokens + [0]
-        )
-        idx = torch.tensor(tokens).unsqueeze(0)
+        for operand in operands_digits:
+            carry = torch.zeros(B, dtype=torch.long)
+            for i in range(max_len - 1, -1, -1):
+                d_acc = current_sum[:, i]
+                d_op = operand[:, i]
+                total = d_acc + d_op + carry
+                carry = total // 10
+                current_sum[:, i] = total
 
-        # Positional IDs (pos1)
-        # n1+ is segment 1, n2= is segment 2, result is segment 3
-        pos1 = (
-            ([1] * (len(n1_tokens) + 1))
-            + ([2] * (len(n2_tokens) + 1))
-            + ([3] * (len(res_tokens) + 1))
-        )
-        pos1_ids = torch.tensor(pos1).unsqueeze(0)
+            scratchpad_segments.append(current_sum.flip(1))  # LSB first
+            current_sum %= 10
 
-        # Positional IDs (pos2)
-        # matches data.py: [L...1, 0] [L...1, 0] [1...L+1]
-        idx_1_L_n1 = list(range(L, 0, -1)) + [0]  # n1 digits + '+'
-        idx_1_L_n2 = list(range(L, 0, -1)) + [0]  # n2 digits + '='
-        idx_L_0 = list(range(1, len(res_tokens) + 2))
+        # 4. Construct Full Sequence
+        p1_list, p2_list, p3_list, tokens_list = [], [], [], []
 
-        pos2 = idx_1_L_n1 + idx_1_L_n2 + idx_L_0
-        pos2_ids = torch.tensor(pos2).unsqueeze(0)
+        plus = torch.full((B, 1), self.plus_token, dtype=torch.long)
+        eq = torch.full((B, 1), self.eq_token, dtype=torch.long)
+        # greater = torch.full((B, 1), self.greater_token, dtype=torch.long) # Need to add > to init if missing
+        # hash_t = torch.full((B, 1), self.hash_token, dtype=torch.long) # Need to add # to init if missing
 
-        return idx, pos1_ids, pos2_ids, tokens
+        # Fallbacks for tokens that might be missing in __init__
+        greater_token = self.stoi.get(
+            ">", self.stoi.get("=")
+        )  # Fallback? No, should exist
+        hash_token = self.stoi.get("#", self.stoi.get("="))
+
+        greater = torch.full((B, 1), greater_token, dtype=torch.long)
+        hash_t = torch.full((B, 1), hash_token, dtype=torch.long)
+
+        # -- Input Phase --
+        for k in range(N_Ops):
+            L_op = operands_digits[k].shape[1]
+            tokens_list.append(operands_digits[k])
+            p1_list.append(torch.full((B, L_op), k + 1, dtype=torch.long))
+            ids = torch.arange(L_op, 0, -1).unsqueeze(0).expand(B, -1)
+            p2_list.append(ids)
+            p3_list.append(torch.full((B, L_op), 1, dtype=torch.long))
+
+            if k < N_Ops - 1:
+                tokens_list.append(plus)
+                p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
+                p2_list.append(torch.zeros((B, 1), dtype=torch.long))
+                p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
+            else:
+                tokens_list.append(eq)
+                p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
+                p2_list.append(torch.zeros((B, 1), dtype=torch.long))
+                p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
+
+        # -- Scratchpad Phase --
+        for k, seg in enumerate(scratchpad_segments):
+            L_seg = seg.shape[1]
+            tokens_list.append(seg)
+            p1_list.append(torch.full((B, L_seg), k + 1, dtype=torch.long))
+            ids = torch.arange(1, L_seg + 1).unsqueeze(0).expand(B, -1)
+            p2_list.append(ids)
+            p3_list.append(torch.full((B, L_seg), 2, dtype=torch.long))
+
+            if k < len(scratchpad_segments) - 1:
+                tokens_list.append(greater)
+                p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
+                p2_list.append(torch.full((B, 1), L_seg + 1, dtype=torch.long))
+                p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
+
+        # End Token [#]
+        tokens_list.append(hash_t)
+        p1_list.append(torch.full((B, 1), N_Ops + 1, dtype=torch.long))
+        p2_list.append(torch.zeros((B, 1), dtype=torch.long))
+        p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
+
+        full_seq = torch.cat(tokens_list, dim=1)
+        pos1 = torch.cat(p1_list, dim=1)
+        pos2 = torch.cat(p2_list, dim=1)
+        pos3 = torch.cat(p3_list, dim=1)
+
+        # Prepare for return
+        # idx, pos1_ids, pos2_ids, tokens (list)
+        return full_seq, pos1, pos2, pos3, full_seq[0].tolist()
 
     def visualize_addition(self, equation_string, save_path=None, all_tokens=False):
         """
         Runs model, extracts attention, and plots the staircase pattern.
         """
-        idx, pos1_ids, pos2_ids, tokens = self.encode_equation(equation_string)
+        idx, pos1_ids, pos2_ids, pos3_ids, tokens = self.encode_equation(
+            equation_string
+        )
 
         # Ensure model is on CPU or same device
         device = next(self.model.parameters()).device
         idx = idx.to(device)
         pos1_ids = pos1_ids.to(device)
         pos2_ids = pos2_ids.to(device)
+        pos3_ids = pos3_ids.to(device)
 
         with torch.no_grad():
             logits, _, all_attn = self.model(
-                idx, pos1_ids, pos2_ids, return_weights=True
+                idx, pos1_ids, pos2_ids, pos3_ids, return_weights=True
             )
 
         probs = torch.softmax(logits[0], dim=-1).cpu()
 
         def decode_mod10(t_id):
             char = self.itos[t_id]
-            if char in ["+", "="]:
+            if char in ["+", "=", ">", "#"]:
                 return char
             return str(int(char) % 10)
 
@@ -126,7 +183,9 @@ class AttentionExplorer:
         ]
         for i in range(len(self.itos)):
             char = self.itos[i]
-            label = char if char in ["+", "="] else f"{char}({int(char) % 10})"
+            label = (
+                char if char in ["+", "=", ">", "#"] else f"{char}({int(char) % 10})"
+            )
             table.append(
                 [f"pr_{label}"] + [f"{probs[j, i]:.2f}" for j in range(len(tokens))]
             )
@@ -206,6 +265,10 @@ class AttentionExplorer:
             # Just the result producing steps
             y_indices = pred_indices
             y_labels = [pred_to_label[i] for i in y_indices]
+
+        # Reverse Y-axis (Time flows upwards: Start at bottom, End at top)
+        y_indices = y_indices[::-1]
+        y_labels = y_labels[::-1]
 
         n_layers = len(all_attn)
         n_heads = all_attn[0].shape[1]

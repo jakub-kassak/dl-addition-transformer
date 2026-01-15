@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#SBATCH --job-name=MixedPE_2D_run
-#SBATCH --time=12:00:00
+#SBATCH --job-name=MultiOperandAddition01
+#SBATCH --time=1:00:00
 #SBATCH --account=deep_learning
-#SBATCH --output=logs/MixedPE_2D_%j.out
-#SBATCH --error=logs/MixedPE_2D_%j.err
+#SBATCH --output=logs/MultiOperandAddition01_%j.out
+#SBATCH --error=logs/MultiOperandAddition01_%j.err
 #SBATCH --mem=32G
 
 # Load modules
@@ -15,7 +15,7 @@ module add cuda/12.4
 source .venv_cluster/bin/activate
 
 # WandB login
-export WANDB_API_KEY=
+export WANDB_API_KEY=bccc3e2d0a4ff78b206521ca8ebc99653d888316
 wandb login $WANDB_API_KEY
 
 # Set python path
@@ -23,17 +23,24 @@ export PYTHONPATH=$PYTHONPATH:$(pwd)
 
 # Run training
 python train.py \
-  --exp_name MixedPE_2D_run_L6_H4_nocarry \
-  --n_layer 6 \
-  --n_embd 256 \
-  --n_head 4 \
-  --learning_rate 5e-4 \
+  --exp_name MultiOperandAddition02_no_curriculum \
+  --n_layer 2 \
+  --n_embd 384 \
+  --n_head 2 \
+  --n_ffwd_depth 2 \
+  --learning_rate 3e-4 \
   --batch_size 256 \
-  --max_iters 10000 \
+  --max_iters 5000 \
   --steps_per_epoch 500 \
+  --min_train_digits 1 \
   --max_train_digits 10 \
-  --val_step 4 \
-  --max_val_digits 50 \
+  --max_val_digits 15 \
+  --min_operands 2 \
+  --max_operands 10 \
+  --max_val_operands 15 \
+  --val_step 2 \
+  --val_operand_step 2 \
   --num_workers 2 \
-  --pos_emb_type abc_mixed \
-  --no-explicit-carry
+  --pos_emb_type mixed \
+  --debug_data \
+  --use_wandb

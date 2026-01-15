@@ -498,46 +498,58 @@ class GPTLightningModule(pl.LightningModule):
             # 1. Forward pass
             logits, _ = self(idx, pos1_ids, pos2_ids, pos3_ids)
             last_logits = logits[:, -1, :]
-            probs = F.softmax(last_logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            
+            # probs = F.softmax(last_logits, dim=-1)
+            # idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = torch.argmax(last_logits, dim=-1, keepdim=True)
+
             # 2. Determine Next Positions based on WHAT WE JUST GENERATED (idx_next)
             # and the context of the LAST token we were at.
-            
+
             last_token = idx[:, -1]
             last_p1 = pos1_ids[:, -1]
             last_p2 = pos2_ids[:, -1]
             last_p3 = pos3_ids[:, -1]
-            
-            # We construct masks for conditions
-            is_eq = (last_token == eq_token)
-            is_greater = (last_token == greater_token)
-            
-            # Base values (for digit continuation)
+
+            # Base logic: Continue segment (increment p2, keep p1, p3=2)
             new_p1 = last_p1.clone()
             new_p2 = last_p2 + 1
-            new_p3 = torch.full_like(last_p3, 2) # Scratchpad is always 2 (or Result)
-            
-            # Case: Eq (End of Input -> Start S0)
-            # p1 becomes 1
-            new_p1 = torch.where(is_eq, torch.tensor(1, device=idx.device), new_p1)
-            # p2 becomes 1 + offset
-            new_p2 = torch.where(is_eq, torch.tensor(1 + offset, device=idx.device), new_p2)
-            
-            # Case: Greater (Separator -> Start Next Block)
-            # p1 increments
-            new_p1 = torch.where(is_greater, last_p1 + 1, new_p1)
-            # p2 resets to 1 + offset
-            new_p2 = torch.where(is_greater, torch.tensor(1 + offset, device=idx.device), new_p2)
+            new_p3 = torch.full_like(last_p3, 2)
 
-            # Case: Hash (End Token)
-            is_hash_next = (idx_next.squeeze(-1) == hash_token)
-            if is_hash_next.any():
-                # Overwrite for hash
-                # p2 becomes 0
-                new_p2 = torch.where(is_hash_next, torch.tensor(0, device=idx.device), new_p2)
-                # p1, p3 stay as computed (p1=last_p1, p3=2)
-            
+            # Masks for Previous Token Context
+            is_prev_eq = last_token == eq_token
+            is_prev_greater = last_token == greater_token
+
+            # Context Case 1: Previous was '=' (End of Input -> Start S0)
+            # p1 becomes 1, p2 becomes 1 + offset
+            new_p1 = torch.where(is_prev_eq, torch.tensor(1, device=idx.device), new_p1)
+            new_p2 = torch.where(
+                is_prev_eq, torch.tensor(1 + offset, device=idx.device), new_p2
+            )
+
+            # Context Case 2: Previous was '>' (Separator -> Start Next Segment)
+            # p1 stays as is (it was already incremented when generating '>'), p2 resets to 1 + offset
+            new_p2 = torch.where(
+                is_prev_greater, torch.tensor(1 + offset, device=idx.device), new_p2
+            )
+
+            # Masks for Current Generated Token
+            is_curr_greater = idx_next.squeeze(-1) == greater_token
+            is_curr_hash = idx_next.squeeze(-1) == hash_token
+
+            # Current Case 1: Generated '>' (Separator)
+            # p1 increments, p2 becomes 0
+            new_p1 = torch.where(is_curr_greater, last_p1 + 1, new_p1)
+            new_p2 = torch.where(
+                is_curr_greater, torch.tensor(0, device=idx.device), new_p2
+            )
+
+            # Current Case 2: Generated '#' (End Token)
+            # p1 increments, p2 becomes 0
+            new_p1 = torch.where(is_curr_hash, last_p1 + 1, new_p1)
+            new_p2 = torch.where(
+                is_curr_hash, torch.tensor(0, device=idx.device), new_p2
+            )
+
             # Reshape for concatenation
             new_p1 = new_p1.unsqueeze(1)
             new_p2 = new_p2.unsqueeze(1)
@@ -547,8 +559,8 @@ class GPTLightningModule(pl.LightningModule):
             pos1_ids = torch.cat((pos1_ids, new_p1), dim=1)
             pos2_ids = torch.cat((pos2_ids, new_p2), dim=1)
             pos3_ids = torch.cat((pos3_ids, new_p3), dim=1)
-            
-            if is_hash_next.all():
+
+            if is_curr_hash.all():
                 break
 
         return idx, pos1_ids, pos2_ids, pos3_ids

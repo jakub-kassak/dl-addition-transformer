@@ -308,9 +308,9 @@ def main():
         help="Type of positional embedding to use.",
     )
     parser.add_argument(
-        "--random_offsets",
+        "--random-offsets",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable random positional offsets for pos2.",
     )
     parser.add_argument("--min_operands", type=int, default=2)

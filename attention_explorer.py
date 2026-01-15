@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import os
+import math
+from data import construct_addition_batch
 
 
 class AttentionExplorer:
@@ -29,7 +31,7 @@ class AttentionExplorer:
     def encode_equation(self, equation_string):
         """
         Encodes an equation string into tokens and positional IDs (P1, P2, P3).
-        Mimics data.py generate_batch logic for specific operands.
+        Uses data.construct_addition_batch logic.
         """
         # Parse operands from equation string
         if "=" in equation_string:
@@ -42,17 +44,10 @@ class AttentionExplorer:
 
         # Determine max_digits and length
         max_digits = max(len(op) for op in operands)
-        carry_allowance = 1  # math.ceil(math.log10(N_Ops)) if N_Ops > 1 else 0 # Simplified for visualizer
-        if N_Ops > 1:
-            import math
-
-            carry_allowance = math.ceil(math.log10(N_Ops))
-
+        carry_allowance = math.ceil(math.log10(N_Ops))
         max_len = max_digits + carry_allowance
 
-        B = 1
-
-        # 2. Generate Op Digits with strict padding
+        # Prepare operands_digits list of tensors
         operands_digits = []
         for op in operands:
             # Pad to max_len (zeros at front/MSB)
@@ -61,91 +56,77 @@ class AttentionExplorer:
             t = torch.tensor(d, dtype=torch.long).unsqueeze(0)  # (1, max_len)
             operands_digits.append(t)
 
-        # 3. Compute Partial Sums
-        scratchpad_segments = []
-        current_sum = torch.zeros((B, max_len), dtype=torch.long)
-        scratchpad_segments.append(current_sum.clone())  # S0
-
-        for operand in operands_digits:
-            carry = torch.zeros(B, dtype=torch.long)
-            for i in range(max_len - 1, -1, -1):
-                d_acc = current_sum[:, i]
-                d_op = operand[:, i]
-                total = d_acc + d_op + carry
-                carry = total // 10
-                current_sum[:, i] = total
-
-            scratchpad_segments.append(current_sum.flip(1))  # LSB first
-            current_sum %= 10
-
-        # 4. Construct Full Sequence
-        p1_list, p2_list, p3_list, tokens_list = [], [], [], []
-
-        plus = torch.full((B, 1), self.plus_token, dtype=torch.long)
-        eq = torch.full((B, 1), self.eq_token, dtype=torch.long)
-        # greater = torch.full((B, 1), self.greater_token, dtype=torch.long) # Need to add > to init if missing
-        # hash_t = torch.full((B, 1), self.hash_token, dtype=torch.long) # Need to add # to init if missing
-
-        # Fallbacks for tokens that might be missing in __init__
-        greater_token = self.stoi.get(
-            ">", self.stoi.get("=")
-        )  # Fallback? No, should exist
-        hash_token = self.stoi.get("#", self.stoi.get("="))
-
-        greater = torch.full((B, 1), greater_token, dtype=torch.long)
-        hash_t = torch.full((B, 1), hash_token, dtype=torch.long)
-
-        # -- Input Phase --
-        for k in range(N_Ops):
-            L_op = operands_digits[k].shape[1]
-            tokens_list.append(operands_digits[k])
-            p1_list.append(torch.full((B, L_op), k + 1, dtype=torch.long))
-            ids = torch.arange(L_op, 0, -1).unsqueeze(0).expand(B, -1)
-            p2_list.append(ids)
-            p3_list.append(torch.full((B, L_op), 1, dtype=torch.long))
-
-            if k < N_Ops - 1:
-                tokens_list.append(plus)
-                p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
-                p2_list.append(torch.zeros((B, 1), dtype=torch.long))
-                p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
-            else:
-                tokens_list.append(eq)
-                p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
-                p2_list.append(torch.zeros((B, 1), dtype=torch.long))
-                p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
-
-        # -- Scratchpad Phase --
-        for k, seg in enumerate(scratchpad_segments):
-            L_seg = seg.shape[1]
-            tokens_list.append(seg)
-            p1_list.append(torch.full((B, L_seg), k + 1, dtype=torch.long))
-            ids = torch.arange(1, L_seg + 1).unsqueeze(0).expand(B, -1)
-            p2_list.append(ids)
-            p3_list.append(torch.full((B, L_seg), 2, dtype=torch.long))
-
-            if k < len(scratchpad_segments) - 1:
-                tokens_list.append(greater)
-                p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
-                p2_list.append(torch.full((B, 1), L_seg + 1, dtype=torch.long))
-                p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
-
-        # End Token [#]
-        tokens_list.append(hash_t)
-        p1_list.append(torch.full((B, 1), N_Ops + 1, dtype=torch.long))
-        p2_list.append(torch.zeros((B, 1), dtype=torch.long))
-        p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
-
-        full_seq = torch.cat(tokens_list, dim=1)
-        pos1 = torch.cat(p1_list, dim=1)
-        pos2 = torch.cat(p2_list, dim=1)
-        pos3 = torch.cat(p3_list, dim=1)
+        # Call construct_addition_batch
+        full_seq, pos1, pos2, pos3 = construct_addition_batch(
+            operands_digits, self.stoi, random_offsets=False
+        )
 
         # Prepare for return
-        # idx, pos1_ids, pos2_ids, tokens (list)
+        # idx, pos1_ids, pos2_ids, pos3_ids, tokens (list)
         return full_seq, pos1, pos2, pos3, full_seq[0].tolist()
 
-    def visualize_addition(self, equation_string, save_path=None, all_tokens=False):
+    def prediction_correctness(
+        self, pred_indices, ground_truth, preds, res_probs, decode, pred_to_label
+    ):
+        print("\nPrediction Analysis for calculated tokens:")
+        all_correct = True
+        for i, pred_idx in enumerate(pred_indices):
+            gt_idx = ground_truth[i].item()
+            gt_char = self.itos[gt_idx]
+            pred_idx_val = preds[i].item()
+            pred_char = self.itos[pred_idx_val]
+            gt_prob = res_probs[i, gt_idx].item()
+
+            gt_display = decode(gt_idx)
+            pred_display = decode(pred_idx_val)
+
+            if gt_idx == pred_idx_val:
+                label = f"{gt_display} ({gt_prob:.1%})"
+                print(
+                    f"  Token {i}: Correct! Target '{gt_char}' ({gt_display}) has prob {gt_prob:.4f}"
+                )
+            else:
+                label = f"{gt_display} (✗ {pred_display} {res_probs[i, pred_idx_val]:.1%}, gt: {gt_prob:.1%})"
+                all_correct = False
+                print(
+                    f"  Token {i}: WRONG! Expected '{gt_char}' ({gt_display}) ({gt_prob:.4f}), got '{pred_char}' ({pred_display}) ({res_probs[i, pred_idx_val]:.4f})"
+                )
+            pred_to_label[pred_idx] = label
+
+        status_text = "PASSED" if all_correct else "FAILED"
+        print(f"Overall Result: {status_text}\n")
+
+    def pred_table(self, tokens, decode, probs):
+        input_tk_names = [decode(t) for t in tokens]
+        output_tk_names = input_tk_names[1:] + [""]
+
+        table = [
+            ["position"] + [str(i) for i in range(len(tokens))],
+            ["input_tk"] + input_tk_names,
+            ["output_tk"] + output_tk_names,
+        ]
+        for i in range(len(self.itos)):
+            label = self.itos[i]
+            table.append([label] + [f"{probs[j, i]:.2f}" for j in range(len(tokens))])
+
+        # Determine column widths for nice printing
+        col_widths = [max(len(str(item)) for item in col) for col in zip(*table)]
+
+        # Print with nice separators
+        header_sep = "-+-".join("-" * w for w in col_widths)
+        print("\nSequence Prediction Analysis (Probabilities per position):")
+        for r_idx, row in enumerate(table):
+            print(
+                " | ".join(
+                    f"{str(item):<{col_widths[i]}}" for i, item in enumerate(row)
+                )
+            )
+            if r_idx in [0, 2]:  # After position, after output_tk
+                print(header_sep)
+
+    def visualize_addition(
+        self, equation_string, save_path=None, all_tokens=False, print_pred_table=False
+    ):
         """
         Runs model, extracts attention, and plots the staircase pattern.
         """
@@ -167,86 +148,29 @@ class AttentionExplorer:
 
         probs = torch.softmax(logits[0], dim=-1).cpu()
 
-        def decode_mod10(t_id):
-            char = self.itos[t_id]
-            if char in ["+", "=", ">", "#"]:
-                return char
-            return str(int(char) % 10)
+        def decode(t_id):
+            return self.itos[t_id]
 
-        input_tk_names = [decode_mod10(t) for t in tokens]
-        output_tk_names = input_tk_names[1:] + [""]
-
-        table = [
-            ["position"] + [str(i) for i in range(len(tokens))],
-            ["input_tk"] + input_tk_names,
-            ["output_tk"] + output_tk_names,
-        ]
-        for i in range(len(self.itos)):
-            char = self.itos[i]
-            label = (
-                char if char in ["+", "=", ">", "#"] else f"{char}({int(char) % 10})"
-            )
-            table.append(
-                [f"pr_{label}"] + [f"{probs[j, i]:.2f}" for j in range(len(tokens))]
-            )
-
-        # Determine column widths for nice printing
-        col_widths = [max(len(str(item)) for item in col) for col in zip(*table)]
-
-        # Print with nice separators
-        header_sep = "-+-".join("-" * w for w in col_widths)
-        print("\nSequence Prediction Analysis (Probabilities per position):")
-        for r_idx, row in enumerate(table):
-            print(
-                " | ".join(
-                    f"{str(item):<{col_widths[i]}}" for i, item in enumerate(row)
-                )
-            )
-            if r_idx in [0, 2]:  # After position, after output_tk
-                print(header_sep)
+        if print_pred_table:
+            self.pred_table(tokens, decode, probs)
 
         # Result indices (where we want to see what tokens we attended to)
-        res_indices = [i for i, p in enumerate(pos1_ids[0]) if p == 3]
-        input_token_labels = [decode_mod10(t) for t in tokens]
+        res_indices = [i for i, p in enumerate(pos3_ids[0]) if p == 2]
+        input_token_labels = [decode(t) for t in tokens]
 
         # Determine model predictions and probabilities for result tokens
         # The prediction for result token at index i is generated by the token at index i-1
         pred_indices = [i - 1 for i in res_indices]
         res_logits = logits[0, pred_indices, :]
         res_probs = F.softmax(res_logits, dim=-1)
-
         preds = torch.argmax(res_logits, dim=-1)
         ground_truth = idx[0, res_indices]
 
         # Mapping from prediction index to its label
         pred_to_label = {}
-        all_correct = True
-        print(f"\nPrediction Analysis for calculated tokens:")
-        for i, pred_idx in enumerate(pred_indices):
-            gt_idx = ground_truth[i].item()
-            gt_char = self.itos[gt_idx]
-            pred_idx_val = preds[i].item()
-            pred_char = self.itos[pred_idx_val]
-            gt_prob = res_probs[i, gt_idx].item()
-
-            gt_display = decode_mod10(gt_idx)
-            pred_display = decode_mod10(pred_idx_val)
-
-            if gt_idx == pred_idx_val:
-                label = f"{gt_display} ({gt_prob:.1%})"
-                print(
-                    f"  Token {i}: Correct! Target '{gt_char}' ({gt_display}) has prob {gt_prob:.4f}"
-                )
-            else:
-                label = f"{gt_display} (✗ {pred_display} {res_probs[i, pred_idx_val]:.1%}, gt: {gt_prob:.1%})"
-                all_correct = False
-                print(
-                    f"  Token {i}: WRONG! Expected '{gt_char}' ({gt_display}) ({gt_prob:.4f}), got '{pred_char}' ({pred_display}) ({res_probs[i, pred_idx_val]:.4f})"
-                )
-            pred_to_label[pred_idx] = label
-
-        status_text = "PASSED" if all_correct else "FAILED"
-        print(f"Overall Result: {status_text}\n")
+        self.prediction_correctness(
+            pred_indices, ground_truth, preds, res_probs, decode, pred_to_label
+        )
 
         # Determine which rows to show on Y-axis
         if all_tokens:
@@ -259,7 +183,7 @@ class AttentionExplorer:
                 else:
                     # For input tokens, we show itos[tokens[i]] -> itos[tokens[i+1]]
                     y_labels.append(
-                        f"{decode_mod10(tokens[i])} \u2192 {decode_mod10(tokens[i + 1])}"
+                        f"{decode(tokens[i])} \u2192 {decode(tokens[i + 1])}"
                     )
         else:
             # Just the result producing steps
@@ -280,17 +204,37 @@ class AttentionExplorer:
             axes = np.array([[ax] for ax in axes])
 
         # Identifying indices for staircase
-        n1_indices = [
-            i
-            for i, p in enumerate(pos1_ids[0])
-            if p == 1 and tokens[i] != self.plus_token
-        ]
-        n2_indices = [
-            i
-            for i, p in enumerate(pos1_ids[0])
-            if p == 2 and tokens[i] != self.eq_token
-        ]
-        L = len(n1_indices)
+        l = len(tokens)
+        n1_indices = []
+        for i in range(l):
+            for j in range(l):
+                if (
+                    pos1_ids[0][i] == pos1_ids[0][j]
+                    and pos2_ids[0][i] == pos2_ids[0][j] + 1
+                    and pos3_ids[0][i] == 1
+                    and pos3_ids[0][j] == 2
+                ):
+                    n1_indices.append((i, j))
+
+        # n2_indices = []
+        # for i in range(l):
+        #     for j in range(l):
+        #         if pos1_ids[0][i] == pos1_ids[0][j] and pos2_ids[0][i] == pos2_ids[0][j] and pos3_ids[0][i] == 1 and pos3_ids[0][j] == 2:
+        #             n1_indices.append((i, j))
+
+        # n1_indices = [(i, j) for i, j in zip(pos1_ids[0], pos2_ids[0]) if j == 1]
+
+        # n1_indices = [
+        #     i
+        #     for i, p in enumerate(pos1_ids[0])
+        #     if p == 1 and tokens[i] != self.plus_token
+        # ]
+        # n2_indices = [
+        #     i
+        #     for i, p in enumerate(pos1_ids[0])
+        #     if p == 2 and tokens[i] != self.eq_token
+        # ]
+        # L = len(n1_indices)
 
         for l in range(n_layers):
             attn = all_attn[l][0]  # (heads, T, T)
@@ -312,26 +256,21 @@ class AttentionExplorer:
                     vmax=1,
                 )
 
-                # Highlight "Staircase" Pattern (only for result positions)
-                for i_y, y_idx in enumerate(y_indices):
-                    if y_idx in pred_indices:
-                        j = pred_indices.index(y_idx)  # Which result digit is this?
-
-                        target_cols = []
-                        if L - 1 - j >= 0:
-                            target_cols.append(n1_indices[L - 1 - j])
-                            target_cols.append(n2_indices[L - 1 - j])
-                        if j > 0:
-                            if L - j >= 0:
-                                target_cols.append(n1_indices[L - j])
-                                target_cols.append(n2_indices[L - j])
-
-                        for col in target_cols:
-                            ax.add_patch(
-                                plt.Rectangle(
-                                    (col, i_y), 1, 1, fill=False, edgecolor="red", lw=2
-                                )
+                # Highlight "Staircase" Pattern
+                for src_idx, dest_idx in n1_indices:
+                    # src_idx is Input (column), dest_idx is Scratchpad (row)
+                    if dest_idx in y_indices:
+                        plot_y = y_indices.index(dest_idx)
+                        ax.add_patch(
+                            plt.Rectangle(
+                                (src_idx, plot_y),
+                                1,
+                                1,
+                                fill=False,
+                                edgecolor="red",
+                                lw=2,
                             )
+                        )
 
                 ax.set_title(f"Layer {l} | Head {h}")
                 ax.set_xlabel("Input Sequence")

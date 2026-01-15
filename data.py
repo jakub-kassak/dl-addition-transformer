@@ -12,6 +12,113 @@ def decode_batch(x, itos):
     return x
 
 
+def construct_addition_batch(
+    operands_digits, stoi, random_offsets=False, offset_range=100
+):
+    """
+    Constructs the full sequence and positional encodings given the operands digits.
+    operands_digits: List of tensors [ (B, max_len), ... ]
+    stoi: dict mapping token to index
+    """
+    B = operands_digits[0].shape[0]
+    max_len = operands_digits[0].shape[1]
+    N_Ops = len(operands_digits)
+
+    plus_token = stoi["+"]
+    eq_token = stoi["="]
+    greater_token = stoi[">"]
+    hash_token = stoi["#"]
+
+    # 3. Compute Partial Sums (S0=0, S1=N1, ..., SN=Sum(N1..NN))
+    # Each Si is stored LSB-first in scratchpad_segments (length max_len)
+    scratchpad_segments = []
+    current_sum = torch.zeros((B, max_len), dtype=torch.long)
+    scratchpad_segments.append(current_sum.clone())
+
+    for operand in operands_digits:
+        carry = torch.zeros(B, dtype=torch.long)
+        for i in range(max_len - 1, -1, -1):
+            d_acc = current_sum[:, i]
+            d_op = operand[:, i]
+
+            total = d_acc + d_op + carry
+            carry = total // 10
+            current_sum[:, i] = total
+
+        scratchpad_segments.append(current_sum.flip(1))
+        current_sum %= 10
+
+    # 4. Construct Full Sequence
+    # Input: N1 + N2 + ... + Nk =
+    # SP: S0 > S1 > ... > Sn #
+    p1_list, p2_list, p3_list, tokens_list = [], [], [], []
+
+    plus = torch.full((B, 1), plus_token, dtype=torch.long)
+    eq = torch.full((B, 1), eq_token, dtype=torch.long)
+    greater = torch.full((B, 1), greater_token, dtype=torch.long)
+    hash_t = torch.full((B, 1), hash_token, dtype=torch.long)
+
+    # -- Input Phase --
+    for k in range(N_Ops):
+        # Operand Nk gets PosID2 = k+1
+        L = operands_digits[k].shape[1]
+        tokens_list.append(operands_digits[k])
+        p1_list.append(torch.full((B, L), k + 1, dtype=torch.long))
+        # PosID1: MSB first uses decreasing IDs. Separator gets 1.
+        # Figure 4 shows 4 3 2 1 for 3-digit number + sep.
+        # So IDs are (L+1) down to 2, then 1 for separator.
+        ids = torch.arange(L, 0, -1).unsqueeze(0).expand(B, -1)
+        p2_list.append(ids)
+        p3_list.append(torch.full((B, L), 1, dtype=torch.long))
+
+        if k < N_Ops - 1:
+            # Separator [+]
+            tokens_list.append(plus)
+        else:
+            # Separator [=]
+            tokens_list.append(eq)
+        p1_list.append(torch.full((B, 1), k + 2, dtype=torch.long))
+        p2_list.append(torch.full((B, 1), L + 1, dtype=torch.long))
+        p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
+
+    # -- Scratchpad Phase --
+    # S0 gets PosID2 = 1 (couples with N1)
+    # S_k gets PosID2 = k+1 (couples with N_{k+1})
+    for k, seg in enumerate(scratchpad_segments):
+        L = seg.shape[1]
+        tokens_list.append(seg)
+        p1_list.append(torch.full((B, L), k + 1, dtype=torch.long))
+        # PosID1: LSB first uses increasing IDs. 1, 2, ..., L
+        ids = torch.arange(1, L + 1).unsqueeze(0).expand(B, -1)
+        p2_list.append(ids)
+        p3_list.append(torch.full((B, L), 2, dtype=torch.long))
+
+        if k < len(scratchpad_segments) - 1:
+            # Separator [>]
+            tokens_list.append(greater)
+            p1_list.append(torch.full((B, 1), k + 2, dtype=torch.long))
+            # Figure 4 shows > gets ID L+1 (4 for 3 digits)
+            p2_list.append(torch.full((B, 1), 0, dtype=torch.long))
+            p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
+
+    # End Token [#]
+    tokens_list.append(hash_t)
+    p1_list.append(torch.full((B, 1), N_Ops + 1, dtype=torch.long))  # Final block
+    p2_list.append(torch.zeros((B, 1), dtype=torch.long))
+    p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
+
+    full_seq = torch.cat(tokens_list, dim=1)
+    pos1 = torch.cat(p1_list, dim=1)
+    pos2 = torch.cat(p2_list, dim=1)
+    pos3 = torch.cat(p3_list, dim=1)
+
+    if random_offsets:
+        offsets = torch.randint(0, offset_range, (B, 1))
+        pos2 = pos2 + offsets
+
+    return full_seq, pos1, pos2, pos3
+
+
 class MultiOperandAdditionDataset(IterableDataset):
     """
     Generates multi-operand addition examples.
@@ -89,94 +196,12 @@ class MultiOperandAdditionDataset(IterableDataset):
                 full_d = torch.cat([padding, d], dim=1)
                 operands_digits.append(full_d)
 
-            # 3. Compute Partial Sums (S0=0, S1=N1, ..., SN=Sum(N1..NN))
-            # Each Si is stored LSB-first in scratchpad_segments (length max_len)
-            scratchpad_segments = []
-            current_sum = torch.zeros((B, max_len), dtype=torch.long)
-            scratchpad_segments.append(current_sum.clone())
-
-            for operand in operands_digits:
-                carry = torch.zeros(B, dtype=torch.long)
-                for i in range(max_len - 1, -1, -1):
-                    d_acc = current_sum[:, i]
-                    d_op = operand[:, i]
-
-                    total = d_acc + d_op + carry
-                    carry = total // 10
-                    current_sum[:, i] = total
-
-                scratchpad_segments.append(current_sum.flip(1))
-                current_sum %= 10
-
-            # 4. Construct Full Sequence
-            # Input: N1 + N2 + ... + Nk =
-            # SP: S0 > S1 > ... > Sn #
-            p1_list, p2_list, p3_list, tokens_list = [], [], [], []
-
-            plus = torch.full((B, 1), self.plus_token, dtype=torch.long)
-            eq = torch.full((B, 1), self.eq_token, dtype=torch.long)
-            greater = torch.full((B, 1), self.greater_token, dtype=torch.long)
-            hash_t = torch.full((B, 1), self.hash_token, dtype=torch.long)
-
-            # -- Input Phase --
-            for k in range(N_Ops):
-                # Operand Nk gets PosID2 = k+1
-                L = operands_digits[k].shape[1]
-                tokens_list.append(operands_digits[k])
-                p1_list.append(torch.full((B, L), k + 1, dtype=torch.long))
-                # PosID1: MSB first uses decreasing IDs. Separator gets 1.
-                # Figure 4 shows 4 3 2 1 for 3-digit number + sep.
-                # So IDs are (L+1) down to 2, then 1 for separator.
-                ids = torch.arange(L, 0, -1).unsqueeze(0).expand(B, -1)
-                p2_list.append(ids)
-                p3_list.append(torch.full((B, L), 1, dtype=torch.long))
-
-                if k < N_Ops - 1:
-                    # Separator [+]
-                    tokens_list.append(plus)
-                else:
-                    # Separator [=]
-                    tokens_list.append(eq)
-                p1_list.append(torch.full((B, 1), k + 2, dtype=torch.long))
-                p2_list.append(torch.full((B, 1), L+1, dtype=torch.long))
-                p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
-
-            # -- Scratchpad Phase --
-            # S0 gets PosID2 = 1 (couples with N1)
-            # S_k gets PosID2 = k+1 (couples with N_{k+1})
-            for k, seg in enumerate(scratchpad_segments):
-                L = seg.shape[1]
-                tokens_list.append(seg)
-                p1_list.append(torch.full((B, L), k + 1, dtype=torch.long))
-                # PosID1: LSB first uses increasing IDs. 1, 2, ..., L
-                ids = torch.arange(1, L + 1).unsqueeze(0).expand(B, -1)
-                p2_list.append(ids)
-                p3_list.append(torch.full((B, L), 2, dtype=torch.long))
-
-                if k < len(scratchpad_segments) - 1:
-                    # Separator [>]
-                    tokens_list.append(greater)
-                    p1_list.append(torch.full((B, 1), k + 2, dtype=torch.long))
-                    # Figure 4 shows > gets ID L+1 (4 for 3 digits)
-                    p2_list.append(torch.full((B, 1), 0, dtype=torch.long))
-                    p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
-
-            # End Token [#]
-            tokens_list.append(hash_t)
-            p1_list.append(
-                torch.full((B, 1), N_Ops + 1, dtype=torch.long)
-            )  # Final block
-            p2_list.append(torch.zeros((B, 1), dtype=torch.long))
-            p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
-
-            full_seq = torch.cat(tokens_list, dim=1)
-            pos1 = torch.cat(p1_list, dim=1)
-            pos2 = torch.cat(p2_list, dim=1)
-            pos3 = torch.cat(p3_list, dim=1)
-
-            if self.random_offsets:
-                offsets = torch.randint(0, self.offset_range, (B, 1))
-                pos2 = pos2 + offsets
+            full_seq, pos1, pos2, pos3 = construct_addition_batch(
+                operands_digits,
+                self.stoi,
+                random_offsets=self.random_offsets,
+                offset_range=self.offset_range,
+            )
 
             x = full_seq[:, :-1]
             y = full_seq[:, 1:]

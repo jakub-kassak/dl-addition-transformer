@@ -134,15 +134,12 @@ class MultiOperandAdditionDataset(IterableDataset):
                 if k < N_Ops - 1:
                     # Separator [+]
                     tokens_list.append(plus)
-                    p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
-                    p2_list.append(torch.zeros((B, 1), dtype=torch.long))
-                    p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
                 else:
                     # Separator [=]
                     tokens_list.append(eq)
-                    p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
-                    p2_list.append(torch.zeros((B, 1), dtype=torch.long))
-                    p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
+                p1_list.append(torch.full((B, 1), k + 2, dtype=torch.long))
+                p2_list.append(torch.full((B, 1), L+1, dtype=torch.long))
+                p3_list.append(torch.full((B, 1), 1, dtype=torch.long))
 
             # -- Scratchpad Phase --
             # S0 gets PosID2 = 1 (couples with N1)
@@ -159,9 +156,9 @@ class MultiOperandAdditionDataset(IterableDataset):
                 if k < len(scratchpad_segments) - 1:
                     # Separator [>]
                     tokens_list.append(greater)
-                    p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
+                    p1_list.append(torch.full((B, 1), k + 2, dtype=torch.long))
                     # Figure 4 shows > gets ID L+1 (4 for 3 digits)
-                    p2_list.append(torch.full((B, 1), L + 1, dtype=torch.long))
+                    p2_list.append(torch.full((B, 1), 0, dtype=torch.long))
                     p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
 
             # End Token [#]

@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#SBATCH --job-name=MultiOperandAddition01
+#SBATCH --job-name=MultiOperandAddition04_ffwd2_dropout_05
 #SBATCH --time=1:00:00
 #SBATCH --account=deep_learning
-#SBATCH --output=logs/MultiOperandAddition01_%j.out
-#SBATCH --error=logs/MultiOperandAddition01_%j.err
+#SBATCH --output=logs/MultiOperandAddition04_ffwd2_dropout_05_%j.out
+#SBATCH --error=logs/MultiOperandAddition04_ffwd2_dropout_05_%j.err
 #SBATCH --mem=32G
 
 # Load modules
@@ -23,18 +23,18 @@ export PYTHONPATH=$PYTHONPATH:$(pwd)
 
 # Run training
 python train.py \
-  --exp_name MultiOperandAddition02_no_curriculum \
+  --exp_name MultiOperandAddition04_ffwd2_dropout_05 \
   --n_layer 2 \
-  --n_embd 384 \
+  --n_embd 512 \
   --n_head 2 \
-  --n_ffwd_depth 2 \
-  --learning_rate 3e-4 \
+  --learning_rate 1e-4 \
   --batch_size 256 \
   --max_iters 5000 \
-  --steps_per_epoch 500 \
+  --steps_per_epoch 200 \
+  --eval_interval 200 \
   --min_train_digits 1 \
   --max_train_digits 10 \
-  --max_val_digits 15 \
+  --max_val_digits 20 \
   --min_operands 2 \
   --max_operands 10 \
   --max_val_operands 15 \
@@ -43,4 +43,7 @@ python train.py \
   --num_workers 2 \
   --pos_emb_type mixed \
   --debug_data \
-  --use_wandb
+  --use_wandb \
+  --n_ffwd_depth 2 \
+  --dropout 0.5 \
+  --no-random-offsets

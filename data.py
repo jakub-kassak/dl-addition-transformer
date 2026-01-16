@@ -13,7 +13,7 @@ def decode_batch(x, itos):
 
 
 def construct_addition_batch(
-    operands_digits, stoi, random_offsets=False, offset_range=100
+    operands_digits, stoi, random_offsets=False, offset_range=100, explicit_carry=True
 ):
     """
     Constructs the full sequence and positional encodings given the operands digits.
@@ -43,6 +43,8 @@ def construct_addition_batch(
 
             total = d_acc + d_op + carry
             carry = total // 10
+            if not explicit_carry:
+                total %= 10
             current_sum[:, i] = total
 
         scratchpad_segments.append(current_sum.flip(1))
@@ -135,6 +137,7 @@ class MultiOperandAdditionDataset(IterableDataset):
         data_mode="variable",  # "padded" or "variable"
         offset_range=100,
         random_offsets=True,
+        explicit_carry=True,
     ):
         super().__init__()
         self.min_digits = min_digits
@@ -145,6 +148,7 @@ class MultiOperandAdditionDataset(IterableDataset):
         self.data_mode = data_mode
         self.offset_range = offset_range
         self.random_offsets = random_offsets
+        self.explicit_carry = explicit_carry
 
         # Vocab: 0-19 (digits+carry), +, =, >, #
         self.chars = [str(i) for i in range(20)] + ["+", "=", ">", "#"]
@@ -201,6 +205,7 @@ class MultiOperandAdditionDataset(IterableDataset):
                 self.stoi,
                 random_offsets=self.random_offsets,
                 offset_range=self.offset_range,
+                explicit_carry=self.explicit_carry,
             )
 
             x = full_seq[:, :-1]
@@ -281,6 +286,7 @@ class SequentialMultiOperandAdditionDataset(IterableDataset):
         data_mode="variable",
         offset_range=100,
         random_offsets=True,
+        explicit_carry=True,
     ):
         super().__init__()
         self.configurations = configurations
@@ -289,6 +295,7 @@ class SequentialMultiOperandAdditionDataset(IterableDataset):
         self.data_mode = data_mode
         self.offset_range = offset_range
         self.random_offsets = random_offsets
+        self.explicit_carry = explicit_carry
 
         # Reuse the logic/vocab from the main dataset
         # We can just instantiate a helper object or copy logic.
@@ -307,6 +314,7 @@ class SequentialMultiOperandAdditionDataset(IterableDataset):
             data_mode=data_mode,
             offset_range=offset_range,
             random_offsets=random_offsets,
+            explicit_carry=explicit_carry,
         )
 
         self.vocab_size = self.template_ds.vocab_size
@@ -365,6 +373,7 @@ class AdditionDataModule(pl.LightningDataModule):
         val_operand_step=2,
         data_mode="variable",
         curriculum_operands_start=None,
+        explicit_carry=True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -380,6 +389,7 @@ class AdditionDataModule(pl.LightningDataModule):
             max_operands=self.hparams.max_operands,
             data_mode=self.hparams.data_mode,
             random_offsets=self.hparams.random_offsets,
+            explicit_carry=self.hparams.explicit_carry,
         )
 
         # Normalize curriculum start immediately
@@ -447,6 +457,7 @@ class AdditionDataModule(pl.LightningDataModule):
             batch_size=self.val_bs,
             data_mode=self.hparams.data_mode,
             random_offsets=self.hparams.random_offsets,
+            explicit_carry=self.hparams.explicit_carry,
         )
 
         return DataLoader(

@@ -56,7 +56,10 @@ def inference(model, operands):
         operands_digits.append(t)
 
     gt_full_seq, gt_pos1, gt_pos2, gt_pos3 = construct_addition_batch(
-        operands_digits, stoi, random_offsets=False
+        operands_digits,
+        stoi,
+        random_offsets=False,
+        explicit_carry=getattr(model.hparams, "explicit_carry", True),
     )
 
     # Extract Prompt parts
@@ -145,8 +148,8 @@ def inference(model, operands):
     p2_all = pos2[0].tolist()
     p3_all = pos3[0].tolist()
 
-    all_tokens_correct = (
-        decode_tokens(all_tokens[:prompt_len] + correct_scratchpad, itos)
+    all_tokens_correct = decode_tokens(
+        all_tokens[:prompt_len] + correct_scratchpad, itos
     )
     all_tokens_correct_str = encode(all_tokens_correct)
     all_tokens_str = encode(decode_tokens(all_tokens, itos))

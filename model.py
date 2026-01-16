@@ -168,6 +168,7 @@ class GPTLightningModule(pl.LightningModule):
         eq_token=-1,
         rope_theta=20000,
         pos_emb_type="rope",  # "learned", "rope", "mixed"
+        explicit_carry=True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -526,14 +527,14 @@ class GPTLightningModule(pl.LightningModule):
                     prog_bar=True,
                 )
 
-                # 2. Unweighted (w = 1)
+                # 2. Geometric Mean (Unweighted Log-Mean, w = 1)
                 self.log(
-                    "val_wlm_unweighted_seq",
+                    "val_geo_mean_seq",
                     calculate_weighted_log_mean(seq_values, weights_unit),
                     prog_bar=True,
                 )
                 self.log(
-                    "val_wlm_unweighted_token",
+                    "val_geo_mean_token",
                     calculate_weighted_log_mean(token_values, weights_unit),
                     prog_bar=True,
                 )

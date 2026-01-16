@@ -58,7 +58,10 @@ class AttentionExplorer:
 
         # Call construct_addition_batch
         full_seq, pos1, pos2, pos3 = construct_addition_batch(
-            operands_digits, self.stoi, random_offsets=False
+            operands_digits,
+            self.stoi,
+            random_offsets=False,
+            explicit_carry=getattr(self.model.hparams, "explicit_carry", True),
         )
 
         # Prepare for return

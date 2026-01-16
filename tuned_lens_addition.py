@@ -312,7 +312,10 @@ class TunedLens:
 
         # Call construct_addition_batch
         full_seq, pos1, pos2, pos3 = construct_addition_batch(
-            operands_digits, self.stoi, random_offsets=False
+            operands_digits,
+            self.stoi,
+            random_offsets=False,
+            explicit_carry=getattr(self.model.hparams, "explicit_carry", True),
         )
 
         # Prepare for return
@@ -512,7 +515,10 @@ def main():
     if args.method == "tuned":
         # Load data for training translators
         dm = AdditionDataModule(
-            min_train_digits=1, max_train_digits=7, batch_size=args.batch_size
+            min_train_digits=1,
+            max_train_digits=7,
+            batch_size=args.batch_size,
+            explicit_carry=getattr(lens.model.hparams, "explicit_carry", True),
         )
         dm.setup()
         train_loader = dm.train_dataloader()

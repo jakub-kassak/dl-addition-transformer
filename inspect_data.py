@@ -16,10 +16,15 @@ def main():
     parser.add_argument("--val_step", type=int, default=3)
     parser.add_argument("--data_mode", type=str, default="variable")
     parser.add_argument("--random_offsets", type=bool, default=False)
+    parser.add_argument(
+        "--explicit_carry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     args = parser.parse_args()
 
     print(
-        f"--- Data Inspection (L={args.min_digits}-{args.max_digits}, N={args.min_operands}-{args.max_operands}, mode={args.data_mode}) ---"
+        f"--- Data Inspection (L={args.min_digits}-{args.max_digits}, N={args.min_operands}-{args.max_operands}, mode={args.data_mode}, explicit_carry={args.explicit_carry}) ---"
     )
 
     # Initialize DataModule
@@ -32,6 +37,7 @@ def main():
         max_operands=args.max_operands,
         data_mode=args.data_mode,
         random_offsets=args.random_offsets,  # Explicitly enable for inspection
+        explicit_carry=args.explicit_carry,
     )
     dm.setup()
 

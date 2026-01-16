@@ -6,7 +6,6 @@ Features experiment isolation, validation-only mode, and length generalization t
 import os
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 import wandb
@@ -144,6 +143,7 @@ def print_data_sample(dm, max_digits, debug_data=False, prefix=""):
         min_operands=2,
         max_operands=dm.hparams.max_operands,
         data_mode=dm.hparams.data_mode,
+        explicit_carry=dm.hparams.explicit_carry,
     )
     batch = temp_ds.generate_batch()
     x, y, p1, p2, p3 = batch
@@ -325,6 +325,12 @@ def main():
         help="Defines wheter the numbers should be padded to the same length or not.",
     )
     parser.add_argument(
+        "--explicit_carry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable explicit carry tokens (10-19) in scratchpad.",
+    )
+    parser.add_argument(
         "--use_wandb", action="store_true", help="Enable WandB logging."
     )
     parser.add_argument(
@@ -368,6 +374,7 @@ def main():
         val_operand_step=args.val_operand_step,
         data_mode=args.data_mode,
         curriculum_operands_start=args.curriculum_operands_start,
+        explicit_carry=args.explicit_carry,
     )
     dm.setup()
 
@@ -391,6 +398,7 @@ def main():
             eq_token=dm.stoi["="],
             rope_theta=args.rope_theta,
             pos_emb_type=args.pos_emb_type,
+            explicit_carry=args.explicit_carry,
         )
 
     # 3. Trainer Setup

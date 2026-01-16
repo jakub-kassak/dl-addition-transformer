@@ -125,7 +125,7 @@ class AttentionExplorer:
                 print(header_sep)
 
     def visualize_addition(
-        self, equation_string, save_path=None, all_tokens=False, print_pred_table=False
+        self, equation_string, save_path=None, all_tokens=False, print_pred_table=False, model_name=""
     ):
         """
         Runs model, extracts attention, and plots the staircase pattern.
@@ -209,32 +209,13 @@ class AttentionExplorer:
         for i in range(l):
             for j in range(l):
                 if (
-                    pos1_ids[0][i] == pos1_ids[0][j]
+                    pos1_ids[0][i] == pos1_ids[0][j] - 1
                     and pos2_ids[0][i] == pos2_ids[0][j] + 1
                     and pos3_ids[0][i] == 1
                     and pos3_ids[0][j] == 2
                 ):
                     n1_indices.append((i, j))
 
-        # n2_indices = []
-        # for i in range(l):
-        #     for j in range(l):
-        #         if pos1_ids[0][i] == pos1_ids[0][j] and pos2_ids[0][i] == pos2_ids[0][j] and pos3_ids[0][i] == 1 and pos3_ids[0][j] == 2:
-        #             n1_indices.append((i, j))
-
-        # n1_indices = [(i, j) for i, j in zip(pos1_ids[0], pos2_ids[0]) if j == 1]
-
-        # n1_indices = [
-        #     i
-        #     for i, p in enumerate(pos1_ids[0])
-        #     if p == 1 and tokens[i] != self.plus_token
-        # ]
-        # n2_indices = [
-        #     i
-        #     for i, p in enumerate(pos1_ids[0])
-        #     if p == 2 and tokens[i] != self.eq_token
-        # ]
-        # L = len(n1_indices)
 
         for l in range(n_layers):
             attn = all_attn[l][0]  # (heads, T, T)
@@ -253,7 +234,7 @@ class AttentionExplorer:
                     annot=False,
                     cbar=True,
                     vmin=0,
-                    vmax=1,
+                    # vmax=1,
                 )
 
                 # Highlight "Staircase" Pattern
@@ -276,7 +257,7 @@ class AttentionExplorer:
                 ax.set_xlabel("Input Sequence")
                 ax.set_ylabel("Generated Tokens")
 
-        plt.suptitle(f"Attention Analysis: {equation_string}", fontsize=16)
+        plt.suptitle(f"Attention Analysis: {equation_string}\nModel: {model_name}", fontsize=16)
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
         if save_path:
@@ -319,4 +300,5 @@ if __name__ == "__main__":
 
     explorer = AttentionExplorer(model)
     print(f"Generating visualization for: {args.equation}")
-    explorer.visualize_addition(args.equation, save_path=args.save, all_tokens=args.all)
+    model_name = str(args.checkpoint).split("/")[-1].split(".")[0]
+    explorer.visualize_addition(args.equation, save_path=args.save, all_tokens=args.all, model_name=model_name)

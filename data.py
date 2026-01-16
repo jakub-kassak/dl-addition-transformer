@@ -21,6 +21,10 @@ class MultiOperandAdditionDataset(IterableDataset):
         data_mode="variable",  # "padded" or "variable"
         offset_range=100,
         random_offsets=True,
+        shared_counter = None,
+        shared_lock = None,
+        steps_per_epoch=-1,
+
     ):
         super().__init__()
         self.min_digits = min_digits
@@ -31,6 +35,7 @@ class MultiOperandAdditionDataset(IterableDataset):
         self.data_mode = data_mode
         self.offset_range = offset_range
         self.random_offsets = random_offsets
+        self.steps_per_epoch = steps_per_epoch
 
         # Vocab: 0-19 (digits+carry), +, =, >, #
         self.chars = [str(i) for i in range(20)] + ["+", "=", ">", "#"]
@@ -46,16 +51,64 @@ class MultiOperandAdditionDataset(IterableDataset):
         # Pad token for batching variable lengths
         self.pad_token = -1
 
+        self.shared_counter = shared_counter
+        self.shared_lock = shared_lock
+
+        self.current_digit = 0
+        self.current_operand = 0
+    
+    def _next_global_idx(self):
+        # If single-worker, fall back to local counter
+        if self.shared_counter is None:
+            if not hasattr(self, "_local_idx"):
+                self._local_idx = 0
+            i = self._local_idx
+            self._local_idx += 1
+            return i
+
+        # Multi-worker: atomically fetch-and-increment
+        with self.shared_lock:
+            i = self.shared_counter.value
+            self.shared_counter.value += 1
+        return i
+
     def __iter__(self):
         while True:
-            yield self.generate_batch()
+            ## not training
+            if self.steps_per_epoch == -1:
+                yield self.generate_batch()
+            else:
+                global_idx = self._next_global_idx()
+                step_in_epoch = global_idx % self.steps_per_epoch
+
+                combs = [
+                    (d, o)
+                    for d in range(self.min_digits, self.max_digits + 1)
+                    for o in range(self.min_operands, self.max_operands + 1)
+                ]
+                d, o = combs[step_in_epoch % len(combs)]
+                self.current_digit, self.current_operand = d, o
+
+                yield self.generate_batch()
+
 
     def generate_batch(self):
         B = self.batch_size
-        N_Ops = random.randint(self.min_operands, self.max_operands)
-        N_Dig = random.randint(self.min_digits, self.max_digits)
-        # with open("logs/log.txt", "a") as f:
-        #     f.write(f"OPS: {self.min_operands}-{self.max_operands} => {N_Ops}, Digits: {self.min_digits}-{self.max_digits} => {N_Dig}\n")
+
+        if self.current_operand == 0:
+            N_Ops = random.randint(self.min_operands, self.max_operands)
+        else:
+            N_Ops = self.current_operand
+            with open("logs/log.txt", "a") as f:
+                f.write(f"OPS: {self.current_operand} \n")
+        if self.current_digit == 0:
+            N_Dig = random.randint(self.min_digits, self.max_digits)
+        else:
+            N_Dig = self.current_digit
+            with open("logs/log.txt", "a") as f:
+                f.write(f" Digits: {self.current_digit} \n")
+
+        
 
         # 1. Determine max_len (padding everything to this length)
         # Allowance for carry: log10(max_operands)
@@ -144,7 +197,7 @@ class MultiOperandAdditionDataset(IterableDataset):
             if k < len(scratchpad_segments) - 1:
                 # Separator [>]
                 tokens_list.append(greater)
-                p1_list.append(torch.full((B, 1), k + 1, dtype=torch.long))
+                p1_list.append(torch.full((B, 1), k + 2, dtype=torch.long))
                 # Figure 4 shows > gets ID L+1 (4 for 3 digits)
                 p2_list.append(torch.full((B, 1), L + 1, dtype=torch.long))
                 p3_list.append(torch.full((B, 1), 2, dtype=torch.long))
@@ -215,6 +268,7 @@ class SequentialMultiOperandAdditionDataset(IterableDataset):
             data_mode=data_mode,
             offset_range=offset_range,
             random_offsets=random_offsets,
+            steps_per_epoch=-1,
         )
 
         self.vocab_size = self.template_ds.vocab_size
@@ -258,6 +312,7 @@ class SequentialMultiOperandAdditionDataset(IterableDataset):
 class AdditionDataModule(pl.LightningDataModule):
     def __init__(
         self,
+        steps_per_epoch =-1,
         min_train_digits=1,
         max_train_digits=7,
         max_val_digits=15,
@@ -286,6 +341,7 @@ class AdditionDataModule(pl.LightningDataModule):
             max_operands=self.hparams.max_operands,
             data_mode=self.hparams.data_mode,
             random_offsets=self.hparams.random_offsets,
+            steps_per_epoch=self.hparams.steps_per_epoch,
         )
 
         self.stoi = self.train_ds.stoi

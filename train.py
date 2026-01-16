@@ -91,6 +91,7 @@ def print_data_sample(dm, debug_data=False, prefix=""):
         min_operands=2,
         max_operands=dm.hparams.max_operands,
         data_mode=dm.hparams.data_mode,
+        steps_per_epoch=-1,
     )
     batch = temp_ds.generate_batch()
     x, y, p1, p2, p3 = batch
@@ -145,7 +146,7 @@ class CurriculumLoggerCallback(Callback):
             print_data_sample(
                 dm,
                 debug_data=self.args.debug_data,
-                prefix=f"Training Epoch {trainer.current_epoch})",
+                prefix=f"Training Epoch {trainer.current_epoch}",
             )
 
 
@@ -250,6 +251,7 @@ def main():
         max_val_operands=args.max_val_operands,
         val_operand_step=args.val_operand_step,
         data_mode=args.data_mode,
+        steps_per_epoch = args.steps_per_epoch
     )
     dm.setup()
 

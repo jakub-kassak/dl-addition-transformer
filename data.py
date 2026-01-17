@@ -115,8 +115,11 @@ def construct_addition_batch(
     pos3 = torch.cat(p3_list, dim=1)
 
     if random_offsets:
-        offsets = torch.randint(0, offset_range, (B, 1))
-        pos2 = pos2 + offsets
+        offsets1 = torch.randint(0, offset_range, (B, 1))
+        offsets2 = torch.randint(0, offset_range, (B, 1))
+        pos1 = pos1 + offsets1
+        pos2 = pos2 + offsets2
+
 
     return full_seq, pos1, pos2, pos3
 

@@ -138,7 +138,7 @@ def print_data_sample(dm, max_digits, debug_data=False, prefix=""):
         dm.hparams.min_train_digits,
         max_digits,
         batch_size=1,
-        offset_range=100,
+        offset_range=dm.hparams.offset_range,
         random_offsets=dm.hparams.random_offsets,
         min_operands=2,
         max_operands=dm.hparams.max_operands,
@@ -313,6 +313,7 @@ def main():
         default=False,
         help="Enable random positional offsets for pos2.",
     )
+    parser.add_argument("--offset_range", type=int, default=0)
     parser.add_argument("--min_operands", type=int, default=2)
     parser.add_argument("--max_operands", type=int, default=5)
     parser.add_argument("--max_val_operands", type=int, default=10)
@@ -367,6 +368,7 @@ def main():
         val_batch_size=args.val_batch_size,
         curriculum_start=args.curriculum_start,
         num_workers=0 if args.smoke_test else args.num_workers,
+        offset_range=args.offset_range,
         random_offsets=args.random_offsets,
         min_operands=args.min_operands,
         max_operands=args.max_operands,
@@ -400,6 +402,18 @@ def main():
             pos_emb_type=args.pos_emb_type,
             explicit_carry=args.explicit_carry,
         )
+
+    # 2b. Safety Checks
+    if args.pos_emb_type == "learned" and args.random_offsets:
+        # Check if max possible p2 (max_len + offset_range) fits in embedding table
+        # max_len = max_val_digits + ceil(log10(max_val_operands))
+        import math
+
+        max_len = args.max_val_digits + math.ceil(math.log10(args.max_val_operands))
+        if max_len + args.offset_range >= model.hparams.max_pos2:
+            print(
+                f"⚠️  [WARNING] Learned PEs might overflow! max_len({max_len}) + offset_range({args.offset_range}) >= max_pos2({model.hparams.max_pos2})"
+            )
 
     # 3. Trainer Setup
     exp_dir = os.path.join("experiments", args.exp_name)

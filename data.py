@@ -114,12 +114,11 @@ def construct_addition_batch(
     pos2 = torch.cat(p2_list, dim=1)
     pos3 = torch.cat(p3_list, dim=1)
 
-    if random_offsets:
+    if random_offsets and offset_range > 0:
         offsets1 = torch.randint(0, offset_range, (B, 1))
         offsets2 = torch.randint(0, offset_range, (B, 1))
         pos1 = pos1 + offsets1
         pos2 = pos2 + offsets2
-
 
     return full_seq, pos1, pos2, pos3
 
@@ -369,6 +368,7 @@ class AdditionDataModule(pl.LightningDataModule):
         num_workers=0,
         curriculum_start=3,
         val_batch_size=None,
+        offset_range=0,
         random_offsets=True,
         min_operands=2,
         max_operands=5,
@@ -391,6 +391,7 @@ class AdditionDataModule(pl.LightningDataModule):
             min_operands=self.hparams.min_operands,
             max_operands=self.hparams.max_operands,
             data_mode=self.hparams.data_mode,
+            offset_range=self.hparams.offset_range,
             random_offsets=self.hparams.random_offsets,
             explicit_carry=self.hparams.explicit_carry,
         )
@@ -459,6 +460,7 @@ class AdditionDataModule(pl.LightningDataModule):
             samples_per_config=batches_per_config,
             batch_size=self.val_bs,
             data_mode=self.hparams.data_mode,
+            offset_range=self.hparams.offset_range,
             random_offsets=self.hparams.random_offsets,
             explicit_carry=self.hparams.explicit_carry,
         )

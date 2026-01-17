@@ -25,7 +25,7 @@ def decode_tokens(tokens: list, itos: dict):
     return list(itos[i] for i in tokens)
 
 
-def inference(model, operands):
+def inference(model, operands, offset=0):
     device = model.device
 
     # Prepare vocab
@@ -59,8 +59,13 @@ def inference(model, operands):
         operands_digits,
         stoi,
         random_offsets=False,
+        offset_range=0,
         explicit_carry=getattr(model.hparams, "explicit_carry", True),
     )
+
+    if offset > 0:
+        gt_pos1 = gt_pos1 + offset
+        gt_pos2 = gt_pos2 + offset
 
     # Extract Prompt parts
     # The prompt is the sequence up to the equals sign.
@@ -131,6 +136,7 @@ def inference(model, operands):
         pos3,
         max_new_tokens=max_gen,
         special_tokens=special_tokens,
+        offset=offset,
     )
 
     # Extract generated portion
@@ -226,6 +232,9 @@ def main():
         default="123,456",
         help="Comma-separated list of operands",
     )
+    parser.add_argument(
+        "--offset", type=int, default=0, help="Positional offset for testing"
+    )
     args = parser.parse_args()
 
     # Device handling
@@ -235,7 +244,7 @@ def main():
     model = load_model(args.ckpt_path, device)
 
     operands = args.operands.split(",")
-    inference(model, operands)
+    inference(model, operands, offset=args.offset)
 
 
 if __name__ == "__main__":

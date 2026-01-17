@@ -128,7 +128,12 @@ class AttentionExplorer:
                 print(header_sep)
 
     def visualize_addition(
-        self, equation_string, save_path=None, all_tokens=False, print_pred_table=False, model_name=""
+        self,
+        equation_string,
+        save_path=None,
+        all_tokens=False,
+        print_pred_table=False,
+        model_name="",
     ):
         """
         Runs model, extracts attention, and plots the staircase pattern.
@@ -219,7 +224,6 @@ class AttentionExplorer:
                 ):
                     n1_indices.append((i, j))
 
-
         for l in range(n_layers):
             attn = all_attn[l][0]  # (heads, T, T)
             for h in range(n_heads):
@@ -260,7 +264,9 @@ class AttentionExplorer:
                 ax.set_xlabel("Input Sequence")
                 ax.set_ylabel("Generated Tokens")
 
-        plt.suptitle(f"Attention Analysis: {equation_string}\nModel: {model_name}", fontsize=16)
+        plt.suptitle(
+            f"Attention Analysis: {equation_string}\nModel: {model_name}", fontsize=16
+        )
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
         if save_path:
@@ -304,4 +310,6 @@ if __name__ == "__main__":
     explorer = AttentionExplorer(model)
     print(f"Generating visualization for: {args.equation}")
     model_name = str(args.checkpoint).split("/")[-1].split(".")[0]
-    explorer.visualize_addition(args.equation, save_path=args.save, all_tokens=args.all, model_name=model_name)
+    explorer.visualize_addition(
+        args.equation, save_path=args.save, all_tokens=args.all, model_name=model_name
+    )

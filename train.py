@@ -277,6 +277,7 @@ def main():
     parser.add_argument("--min_train_digits", type=int, default=1)
     parser.add_argument("--max_train_digits", type=int, default=7)
     parser.add_argument("--max_val_digits", type=int, default=15)
+    parser.add_argument("--min_val_digits", type=int, default=None)
     parser.add_argument("--val_step", type=int, default=3)
 
     parser.add_argument("--max_iters", type=int, default=10000)
@@ -317,6 +318,7 @@ def main():
     parser.add_argument("--min_operands", type=int, default=2)
     parser.add_argument("--max_operands", type=int, default=5)
     parser.add_argument("--max_val_operands", type=int, default=10)
+    parser.add_argument("--min_val_operands", type=int, default=None)
     parser.add_argument("--val_operand_step", type=int, default=2)
     parser.add_argument(
         "--data_mode",
@@ -374,6 +376,8 @@ def main():
         max_operands=args.max_operands,
         max_val_operands=args.max_val_operands,
         val_operand_step=args.val_operand_step,
+        min_val_digits=args.min_val_digits,
+        min_val_operands=args.min_val_operands,
         data_mode=args.data_mode,
         curriculum_operands_start=args.curriculum_operands_start,
         explicit_carry=args.explicit_carry,

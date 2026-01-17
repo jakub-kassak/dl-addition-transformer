@@ -374,6 +374,8 @@ class AdditionDataModule(pl.LightningDataModule):
         max_operands=5,
         max_val_operands=10,
         val_operand_step=2,
+        min_val_digits=None,
+        min_val_operands=None,
         data_mode="variable",
         curriculum_operands_start=None,
         explicit_carry=True,
@@ -424,13 +426,23 @@ class AdditionDataModule(pl.LightningDataModule):
         min_train_digits = self.hparams.min_train_digits
         val_step_digits = self.hparams.val_step
 
-        min_val_ops = self.hparams.min_operands
+        min_val_digits = (
+            self.hparams.min_val_digits
+            if self.hparams.min_val_digits is not None
+            else min_train_digits
+        )
+
+        min_val_ops = (
+            self.hparams.min_val_operands
+            if self.hparams.min_val_operands is not None
+            else self.hparams.min_operands
+        )
         max_val_ops = self.hparams.max_val_operands
         val_step_ops = self.hparams.val_operand_step
 
         # 1. Lengths Grid
         lengths = sorted(
-            list(range(min_train_digits, max_val_digits + 1, max(1, val_step_digits)))
+            list(range(min_val_digits, max_val_digits + 1, max(1, val_step_digits)))
         )
 
         # 2. Operands Grid

@@ -132,8 +132,11 @@ class AttentionExplorer:
         equation_string,
         save_path=None,
         all_tokens=False,
+        show_transitions=False,
         print_pred_table=False,
         model_name="",
+        start=None,
+        end=None,
     ):
         """
         Runs model, extracts attention, and plots the staircase pattern.
@@ -164,6 +167,11 @@ class AttentionExplorer:
 
         # Result indices (where we want to see what tokens we attended to)
         res_indices = [i for i, p in enumerate(pos3_ids[0]) if p == 2]
+
+        # Slice result indices if start/end are provided
+        if start is not None or end is not None:
+            res_indices = res_indices[start:end]
+
         input_token_labels = [decode(t) for t in tokens]
 
         # Determine model predictions and probabilities for result tokens
@@ -183,20 +191,34 @@ class AttentionExplorer:
         # Determine which rows to show on Y-axis
         if all_tokens:
             # Show all tokens up to the last prediction made
-            y_indices = list(range(len(tokens)))
+            y_indices = list(range(len(tokens) - 1))
             y_labels = []
             for i in y_indices:
+                # target_display is what we predict/expect at position i+1
                 if i in pred_to_label:
-                    y_labels.append(pred_to_label[i])
+                    # Use the descriptive label (e.g. "5 (99.7%)")
+                    target_display = pred_to_label[i]
                 else:
-                    # For input tokens, we show itos[tokens[i]] -> itos[tokens[i+1]]
-                    y_labels.append(
-                        f"{decode(tokens[i])} \u2192 {decode(tokens[i + 1])}"
-                    )
+                    # Use the actual token at i+1
+                    target_display = decode(tokens[i + 1])
+
+                if show_transitions:
+                    y_labels.append(f"{decode(tokens[i])} \u2192 {target_display}")
+                else:
+                    y_labels.append(target_display)
         else:
             # Just the result producing steps
             y_indices = pred_indices
-            y_labels = [pred_to_label[i] for i in y_indices]
+            if show_transitions:
+                y_labels = []
+                for i in y_indices:
+                    # For result indices i, tokens[i] is the token that makes the prediction
+                    # However pred_indices are res_indices - 1.
+                    # So for res_idx, the prediction is made by token at res_idx-1.
+                    # If i is in pred_indices, then i+1 is the res_idx.
+                    y_labels.append(f"{decode(tokens[i])} \u2192 {pred_to_label[i]}")
+            else:
+                y_labels = [pred_to_label[i] for i in y_indices]
 
         # Reverse Y-axis (Time flows upwards: Start at bottom, End at top)
         y_indices = y_indices[::-1]
@@ -214,15 +236,44 @@ class AttentionExplorer:
         # Identifying indices for staircase
         l = len(tokens)
         n1_indices = []
+        n2_indices = []
         for i in range(l):
             for j in range(l):
-                if (
+                if (  # input operand Xi
                     pos1_ids[0][i] == pos1_ids[0][j] - 1
                     and pos2_ids[0][i] == pos2_ids[0][j] + 1
                     and pos3_ids[0][i] == 1
                     and pos3_ids[0][j] == 2
                 ):
                     n1_indices.append((i, j))
+                    n2_indices.append((i + 1, j))
+                if (  # intermediate sum S{i-1}
+                    pos1_ids[0][i] == pos1_ids[0][j] - 1
+                    and pos2_ids[0][i] == pos2_ids[0][j] + 1
+                    and pos3_ids[0][i] == 2
+                    and pos3_ids[0][j] == 2
+                ):
+                    n1_indices.append((i, j))
+                    n2_indices.append((i - 1, j))
+
+        print("\nAverage Attention Probability for n2_indices (Staircase adjacent):")
+        for l_idx in range(n_layers):
+            attn = all_attn[l_idx][0]  # (heads, T, T)
+            for h_idx in range(n_heads):
+                vals = []
+                for src_idx, dest_idx in n2_indices:
+                    if 0 <= src_idx < attn.shape[2] and 0 <= dest_idx < attn.shape[1]:
+                        vals.append(attn[h_idx, dest_idx, src_idx].item())
+
+                if vals:
+                    avg = sum(vals) / len(vals)
+                    vals.sort()
+                    median = vals[len(vals) // 2]
+                    print(
+                        f"  Layer {l_idx}, Head {h_idx}: avg={avg:.4f}, median={median:.4f}"
+                    )
+                else:
+                    print(f"  Layer {l_idx}, Head {h_idx}: N/A (no valid indices)")
 
         for l in range(n_layers):
             attn = all_attn[l][0]  # (heads, T, T)
@@ -256,6 +307,22 @@ class AttentionExplorer:
                                 1,
                                 fill=False,
                                 edgecolor="red",
+                                lw=2,
+                            )
+                        )
+
+                # Highlight "Staircase" Pattern
+                for src_idx, dest_idx in n2_indices:
+                    # src_idx is Input (column), dest_idx is Scratchpad (row)
+                    if dest_idx in y_indices:
+                        plot_y = y_indices.index(dest_idx)
+                        ax.add_patch(
+                            plt.Rectangle(
+                                (src_idx, plot_y),
+                                1,
+                                1,
+                                fill=False,
+                                edgecolor="green",
                                 lw=2,
                             )
                         )
@@ -299,7 +366,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--all", action="store_true", help="Show all tokens on Y-axis (input + result)"
     )
+    parser.add_argument(
+        "--show_transitions",
+        action="store_true",
+        help="Show transitions (x -> y) on Y-axis",
+    )
     parser.add_argument("--save", type=str, help="Path to save the plot")
+    parser.add_argument(
+        "--start", type=int, default=None, help="Start index of result region to show"
+    )
+    parser.add_argument(
+        "--end", type=int, default=None, help="End index of result region to show"
+    )
 
     args = parser.parse_args()
 
@@ -309,7 +387,13 @@ if __name__ == "__main__":
 
     explorer = AttentionExplorer(model)
     print(f"Generating visualization for: {args.equation}")
-    model_name = str(args.checkpoint).split("/")[-1].split(".")[0]
+    model_name = str(args.checkpoint).split("/")[-3].split(".")[0]
     explorer.visualize_addition(
-        args.equation, save_path=args.save, all_tokens=args.all, model_name=model_name
+        args.equation,
+        save_path=args.save,
+        all_tokens=args.all,
+        show_transitions=args.show_transitions,
+        model_name=model_name,
+        start=args.start,
+        end=args.end,
     )

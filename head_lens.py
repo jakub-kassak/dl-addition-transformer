@@ -11,54 +11,6 @@ from rich.console import Console
 from rich.table import Table
 
 
-class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-    """
-
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        super().__init__(params, defaults)
-
-    def step(self):
-        for group in self.param_groups:
-            lr = group["lr"]
-            momentum = group["momentum"]
-            nesterov = group["nesterov"]
-            ns_steps = group["ns_steps"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g = p.grad
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-                else:
-                    g = buf
-                update = self._newton_schulz(g, ns_steps)
-                p.data.add_(update, alpha=-lr)
-
-    @staticmethod
-    def _newton_schulz(G, steps=5):
-        assert len(G.shape) == 2
-        a, b, c = 3.4445, -4.7750, 2.0315
-        X = G.bfloat16() if G.is_cuda and G.dtype != torch.float16 else G
-        X /= X.norm() + 1e-7
-        if G.shape[0] > G.shape[1]:
-            X = X.T
-        for _ in range(steps):
-            A = X @ X.T
-            B = b * A + c * A @ A
-            X = a * X + B @ X
-        if G.shape[0] > G.shape[1]:
-            X = X.T
-        return X.to(G.dtype)
-
-
 class TunedLensTranslator(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
@@ -203,7 +155,7 @@ class HeadLens:
 
         optimizers = []
         if muon_params:
-            optimizers.append(Muon(muon_params, lr=lr))
+            optimizers.append(torch.optim.Muon(muon_params, lr=lr))
         if adam_params:
             optimizers.append(torch.optim.AdamW(adam_params, lr=0.01))
 
@@ -333,7 +285,13 @@ def main():
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--equation", type=str, required=True)
     parser.add_argument(
-        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+        "--device",
+        type=str,
+        default="cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu",
     )
     parser.add_argument("--top_k", type=int, default=1)
     parser.add_argument(

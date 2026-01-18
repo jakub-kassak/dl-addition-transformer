@@ -438,8 +438,12 @@ class GPTLightningModule(pl.LightningModule):
             on_epoch=True,
             prog_bar=False,
         )
-
-        return loss
+        return {
+            "loss": loss,
+            "token_acc": token_acc,
+            "seq_acc": seq_acc,
+            "config_idx": config_idx,
+        }
 
     def on_validation_epoch_end(self):
         # We need to manually aggregate because we are logging dynamic keys

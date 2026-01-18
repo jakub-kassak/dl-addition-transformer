@@ -18,7 +18,73 @@ from data import AdditionDataModule
 
 
 class ValidationTableCallback(Callback):
+    def __init__(self, exp_name):
+        super().__init__()
+        self.exp_name = exp_name
+        self.current_config_idx = -1
+        self.config_seq_accs = []
+        self.config_token_accs = []
+
+    def on_validation_batch_end(
+        self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0
+    ):
+        if outputs is None or "config_idx" not in outputs:
+            return
+
+        config_idx = outputs["config_idx"]
+        if hasattr(config_idx, "item"):
+            config_idx = config_idx.item()
+
+        # If config changed, print results for the previous one
+        if config_idx != self.current_config_idx and self.current_config_idx != -1:
+            self._print_config_progress(trainer)
+
+        if config_idx != self.current_config_idx:
+            self.current_config_idx = config_idx
+            self.config_seq_accs = []
+            self.config_token_accs = []
+
+        self.config_seq_accs.append(outputs["seq_acc"])
+        self.config_token_accs.append(outputs["token_acc"])
+
+    def _print_config_progress(self, trainer):
+        if not self.config_seq_accs:
+            return
+
+        val_names = getattr(trainer.datamodule, "val_config_names", [])
+        if self.current_config_idx < len(val_names):
+            name = val_names[self.current_config_idx]
+            avg_seq = (
+                torch.stack(self.config_seq_accs).mean().item()
+                if isinstance(self.config_seq_accs[0], torch.Tensor)
+                else sum(self.config_seq_accs) / len(self.config_seq_accs)
+            )
+            avg_token = (
+                torch.stack(self.config_token_accs).mean().item()
+                if isinstance(self.config_token_accs[0], torch.Tensor)
+                else sum(self.config_token_accs) / len(self.config_token_accs)
+            )
+            print(
+                f"  [Progress] Config {self.current_config_idx:3}: {name:<12} | Seq Acc: {avg_seq:.4f} | Token Acc: {avg_token:.4f}"
+            )
+
+            # Log to WandB if available
+            if trainer.loggers:
+                for logger in trainer.loggers:
+                    if isinstance(logger, WandbLogger):
+                        logger.experiment.log(
+                            {
+                                f"val_acc_seq/{name}": avg_seq,
+                                f"val_acc_token/{name}": avg_token,
+                            },
+                        )
+
     def on_validation_epoch_end(self, trainer, pl_module):
+        # Print the last config progress before ending
+        if self.current_config_idx != -1:
+            self._print_config_progress(trainer)
+            self.current_config_idx = -1  # Reset for next epoch
+
         console = Console()
 
         # Get validation names from datamodule
@@ -129,6 +195,59 @@ class ValidationTableCallback(Callback):
                         },
                         step=trainer.global_step,
                     )
+
+        # Save to CSV
+        import csv
+
+        exp_dir = os.path.join("experiments", self.exp_name)
+        os.makedirs(exp_dir, exist_ok=True)
+        csv_path = os.path.join(exp_dir, "val_results.csv")
+        file_exists = os.path.exists(csv_path)
+
+        with open(csv_path, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(
+                    [
+                        "epoch",
+                        "step",
+                        "config_name",
+                        "L",
+                        "N",
+                        "val_acc_token",
+                        "val_acc_seq",
+                        "val_loss",
+                    ]
+                )
+
+            for c in parsed_configs:
+                name = c["name"]
+                L = c["L"]
+                N = c["N"]
+                acc_token = metrics.get(f"val_acc_token/{name}", 0.0)
+                acc_seq = metrics.get(f"val_acc_seq/{name}", 0.0)
+                loss = metrics.get(f"val_loss/{name}", 0.0)
+
+                # Metrics might be tensors
+                if hasattr(acc_token, "item"):
+                    acc_token = acc_token.item()
+                if hasattr(acc_seq, "item"):
+                    acc_seq = acc_seq.item()
+                if hasattr(loss, "item"):
+                    loss = loss.item()
+
+                writer.writerow(
+                    [
+                        trainer.current_epoch,
+                        trainer.global_step,
+                        name,
+                        L,
+                        N,
+                        acc_token,
+                        acc_seq,
+                        loss,
+                    ]
+                )
 
 
 def print_data_sample(dm, max_digits, debug_data=False, prefix=""):
@@ -267,6 +386,12 @@ def main():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--val_batch_size", type=int, default=20)
     parser.add_argument(
+        "--val_samples",
+        type=int,
+        default=None,
+        help="Number of examples per validation configuration. Defaults to val_batch_size.",
+    )
+    parser.add_argument(
         "--debug_data",
         action="store_true",
         help="Print detailed data samples (inputs, pos1, pos2) before training.",
@@ -357,6 +482,9 @@ def main():
         if args.curriculum_operands_start is not None
         else args.max_operands
     )
+    args.val_samples = (
+        args.val_samples if args.val_samples is not None else args.val_batch_size
+    )
 
     pl.seed_everything(args.seed)
 
@@ -381,6 +509,7 @@ def main():
         data_mode=args.data_mode,
         curriculum_operands_start=args.curriculum_operands_start,
         explicit_carry=args.explicit_carry,
+        val_samples=args.val_samples,
     )
     dm.setup()
 
@@ -442,7 +571,7 @@ def main():
         "callbacks": [
             checkpoint_callback,
             lr_monitor,
-            ValidationTableCallback(),
+            ValidationTableCallback(args.exp_name),
             CurriculumLoggerCallback(args),
         ],
         "accelerator": "auto",
@@ -481,6 +610,7 @@ def main():
     if args.validate_only:
         if not args.ckpt_path:
             raise ValueError("Must provide --ckpt_path when using --validate_only.")
+        print("\n--- Validation ---")
         trainer.validate(model, datamodule=dm, ckpt_path=args.ckpt_path)
     else:
         # Initial debug print
@@ -493,18 +623,6 @@ def main():
 
         print("\n--- Training ---")
         trainer.fit(model, datamodule=dm, ckpt_path=args.ckpt_path)
-
-    # 5. Final Inference Test
-    if not args.smoke_test:
-        print("\n--- Spot Check (Multi Operand) ---")
-        model.eval()
-        model.to("cpu")
-
-        # Simple test: 2 operands, non-random
-        # We need to construct a valid batch manually or just skip complex inference here.
-        # Given complexity of new PEs and Dataset, manual construction is error prone.
-        # We will skip manual construction and rely on print_data_sample verifying data.
-        pass
 
 
 if __name__ == "__main__":

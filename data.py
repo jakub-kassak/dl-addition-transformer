@@ -379,6 +379,7 @@ class AdditionDataModule(pl.LightningDataModule):
         data_mode="variable",
         curriculum_operands_start=None,
         explicit_carry=True,
+        val_samples=None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -444,11 +445,20 @@ class AdditionDataModule(pl.LightningDataModule):
         lengths = sorted(
             list(range(min_val_digits, max_val_digits + 1, max(1, val_step_digits)))
         )
+        if min_val_digits < min_train_digits:
+            lengths.extend(range(min_val_digits, min_train_digits, 1))
+            lengths = sorted(list(set(lengths)))
+
+        # lengths = list(range(1, 6)) + list(range(6, 41, 2))
 
         # 2. Operands Grid
         operands = sorted(
             list(range(min_val_ops, max_val_ops + 1, max(1, val_step_ops)))
         )
+        if min_val_ops < self.hparams.min_operands:
+            operands.extend(range(min_val_ops, self.hparams.min_operands, 1))
+            operands = sorted(list(set(operands)))
+        # operands = list(range(2, 6)) + list(range(6, 41, 2))
 
         # Generate Configurations
         self.val_config_names = []
@@ -459,12 +469,9 @@ class AdditionDataModule(pl.LightningDataModule):
                 configurations.append((L, N))
                 self.val_config_names.append(f"val_L{L}_N{N}")
 
-        # Samples per config: We had limit_val_batches=50 in train.py?
-        # Or val_bs * limit_val_batches?
-        # Standard validation often runs for a fixed number of steps per loader.
-        # train.py uses limit_val_batches=50.
-        # Let's target 20 batches per config (arbitrary, user can tune).
-        batches_per_config = 20
+        # Samples per config
+        val_samples = self.hparams.val_samples or self.val_bs
+        batches_per_config = math.ceil(val_samples / self.val_bs)
 
         # Single Sequential Dataset
         val_ds = SequentialMultiOperandAdditionDataset(
